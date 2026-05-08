@@ -3,6 +3,7 @@ import St from 'gi://St';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
+import Soup from 'gi://Soup';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
@@ -13,6 +14,7 @@ const MPRIS_PLAYER_INTERFACE = 'org.mpris.MediaPlayer2.Player';
 
 // Lyrics API configuration
 const LYRICS_API_URL = 'https://lrclib.net/api/get';
+const LYRICS_CACHE_MAX_BYTES = 10 * 1024 * 1024;
 
 // Helper function to check if a bus name is a supported music player
 function isSupportedPlayer(busName) {
@@ -92,21 +94,41 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._currentTrack = null;
             this._currentLyrics = null;
             this._currentLine = '';
+            this._lyricsCache = new Map();
+            this._lyricsCacheDir = GLib.build_filenamev([
+                GLib.get_user_cache_dir(),
+                'spotline',
+                'lyrics-v1'
+            ]);
             this._proxy = null;
             this._propertiesChangedId = null;
             this._lyricsTimeoutId = null;
             this._currentBusName = null;
-            this._busWatchId = null;
+            this._dbusProxy = null;
+            this._nameOwnerChangedId = null;
+            this._propertiesSubscriptionId = null;
+
+            this._soupSession = new Soup.Session();
+            this._soupSession.user_agent = 'Spotline GNOME Extension/1.0';
 
             // Internal state for lyrics - using GSettings for preferences now
             this._showLyrics = true;
+            this._isDestroyed = false;
+            this._maxLength = this._settings.get_int('max-text-length');
+            this._lyricsOffset = this._settings.get_int('lyrics-offset');
 
             // Connect setting signals
             this._settingsSignalId = this._settings.connect('changed::max-text-length', () => {
+                this._maxLength = this._settings.get_int('max-text-length');
                 this._updateLabelText();
             });
 
+            this._offsetSignalId = this._settings.connect('changed::lyrics-offset', () => {
+                this._lyricsOffset = this._settings.get_int('lyrics-offset');
+            });
+
             this._buildMenu();
+            this._initLyricsCacheDirectory();
             this._setupDBusMonitoring();
         }
 
@@ -187,9 +209,9 @@ const MusicLyricsIndicator = GObject.registerClass(
                         GLib.source_remove(this._lyricsTimeoutId);
                         this._lyricsTimeoutId = null;
                     }
-                    this._updateTrackInfo();
+                    this._updateTrackInfo(true);
                 } else {
-                    this._updateTrackInfo();
+                    this._updateTrackInfo(true);
                 }
             });
             this.menu.addMenuItem(this._lyricsToggle);
@@ -240,10 +262,16 @@ const MusicLyricsIndicator = GObject.registerClass(
                     Gio.DBusCallFlags.NONE,
                     -1,
                     null,
-                    null
+                    (proxy, result) => {
+                        try {
+                            proxy.call_finish(result);
+                        } catch (e) {
+                            logError(e, `Failed to execute ${action}`);
+                        }
+                    }
                 );
             } catch (e) {
-                logError(e, `Failed to ${action}`);
+                logError(e, `Failed to call ${action}`);
             }
         }
 
@@ -265,14 +293,55 @@ const MusicLyricsIndicator = GObject.registerClass(
         }
 
         _setupDBusMonitoring() {
-            // Watch for new media players appearing on the bus
-            this._busWatchId = Gio.bus_watch_name(
-                Gio.BusType.SESSION,
-                'org.mpris.MediaPlayer2.*',
-                Gio.BusNameWatcherFlags.NONE,
-                () => this._findActivePlayer(),
-                () => this._findActivePlayer()
-            );
+            try {
+                this._dbusProxy = Gio.DBusProxy.new_for_bus_sync(
+                    Gio.BusType.SESSION,
+                    Gio.DBusProxyFlags.NONE,
+                    null,
+                    'org.freedesktop.DBus',
+                    '/org/freedesktop/DBus',
+                    'org.freedesktop.DBus',
+                    null
+                );
+
+                this._nameOwnerChangedId = this._dbusProxy.connect('g-signal', (proxy, senderName, signalName, parameters) => {
+                    if (signalName === 'NameOwnerChanged') {
+                        const [name, oldOwner, newOwner] = parameters.deep_unpack();
+                        if (name.startsWith('org.mpris.MediaPlayer2.')) {
+                            this._findActivePlayer();
+                        }
+                    }
+                });
+
+                // Watch for PropertiesChanged from any MPRIS player
+                const connection = Gio.bus_get_sync(Gio.BusType.SESSION, null);
+                this._propertiesSubscriptionId = connection.signal_subscribe(
+                    null,
+                    'org.freedesktop.DBus.Properties',
+                    'PropertiesChanged',
+                    MPRIS_PLAYER_PATH,
+                    null,
+                    Gio.DBusSignalFlags.NONE,
+                    (conn, sender, path, iface, signal, parameters) => {
+                        try {
+                            const [changedIface, changedProps] = parameters.deep_unpack();
+                            if (changedIface === MPRIS_PLAYER_INTERFACE) {
+                                // If playback status changes to Playing on any player, re-evaluate
+                                if (changedProps['PlaybackStatus']) {
+                                    const status = changedProps['PlaybackStatus'].deep_unpack();
+                                    if (status === 'Playing') {
+                                        this._findActivePlayer();
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            // Ignore unpacking errors
+                        }
+                    }
+                );
+            } catch (e) {
+                logError(e, 'Failed to setup DBus monitoring');
+            }
 
             this._findActivePlayer();
         }
@@ -296,6 +365,7 @@ const MusicLyricsIndicator = GObject.registerClass(
                     -1,
                     null,
                     (proxy, result) => {
+                        if (this._isDestroyed) return;
                         try {
                             const reply = proxy.call_finish(result);
                             const names = reply.get_child_value(0).deep_unpack();
@@ -363,6 +433,10 @@ const MusicLyricsIndicator = GObject.registerClass(
         }
 
         _tryConnectToPlayer(busName) {
+            if (this._currentBusName === busName) {
+                return true;
+            }
+
             try {
                 // Create proxy for properties interface
                 const proxy = Gio.DBusProxy.new_for_bus_sync(
@@ -394,6 +468,7 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._proxy = proxy;
                 this._playerProxy = playerProxy;
                 this._currentBusName = busName;
+                this._currentTrack = null;
 
                 this._propertiesChangedId = this._playerProxy.connect(
                     'g-properties-changed',
@@ -448,7 +523,7 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._updatePlayPauseButton();
         }
 
-        _updateTrackInfo() {
+        _updateTrackInfo(forceFetch = false) {
             if (!this._playerProxy) {
                 return;
             }
@@ -462,30 +537,69 @@ const MusicLyricsIndicator = GObject.registerClass(
                 }
 
                 const metadataDict = metadata.deep_unpack();
-                const title = metadataDict['xesam:title']?.unpack() || null;
-                const artist = metadataDict['xesam:artist']?.deep_unpack()[0] || null;
-                const album = metadataDict['xesam:album']?.unpack() || null;
+                
+                let title = 'Unknown Track';
+                const titleVariant = metadataDict['xesam:title'];
+                if (titleVariant) {
+                    const unpackedTitle = titleVariant.deep_unpack();
+                    title = Array.isArray(unpackedTitle) ? unpackedTitle[0] : unpackedTitle;
+                }
+
+                let artist = 'Unknown Artist';
+                const artistVariant = metadataDict['xesam:artist'];
+                if (artistVariant) {
+                    const unpackedArtist = artistVariant.deep_unpack();
+                    artist = Array.isArray(unpackedArtist) ? unpackedArtist[0] : unpackedArtist;
+                }
+
+                let album = 'Unknown Album';
+                const albumVariant = metadataDict['xesam:album'];
+                if (albumVariant) {
+                    const unpackedAlbum = albumVariant.deep_unpack();
+                    album = Array.isArray(unpackedAlbum) ? unpackedAlbum[0] : unpackedAlbum;
+                }
+
+                let duration = 0;
+                const durationVariant = metadataDict['mpris:length'];
+                if (durationVariant) {
+                    const unpackedDuration = durationVariant.deep_unpack();
+                    duration = Math.round(unpackedDuration / 1000000); // Convert microseconds to seconds
+                }
 
                 // If both title and artist are missing, show icon or nothing
-                if (!title && !artist) {
+                if (title === 'Unknown Track' && artist === 'Unknown Artist') {
                     this._updateLabelText('♪');
                     this._trackInfoItem.label.text = 'Unknown track';
                     return;
                 }
 
+                // Check if lyrics query inputs changed to avoid redundant API calls
+                const lyricsQueryChanged = forceFetch ||
+                                           !this._currentTrack ||
+                                           this._currentTrack.title !== title ||
+                                           this._currentTrack.artist !== artist;
+
                 this._currentTrack = {
-                    title: title || 'Unknown Track',
-                    artist: artist || 'Unknown Artist',
-                    album: album || 'Unknown Album'
+                    title: title,
+                    artist: artist,
+                    album: album,
+                    duration: duration
                 };
 
                 // Update menu with track info
                 this._trackInfoItem.label.text = `${this._currentTrack.artist} - ${this._currentTrack.title}`;
 
-                // Try to fetch lyrics if enabled
-                if (this._showLyrics) {
-                    this._fetchLyrics(this._currentTrack.title, this._currentTrack.artist);
-                } else {
+                // Only fetch lyrics if the query inputs changed or it's forced
+                if (lyricsQueryChanged) {
+                    // Update label immediately with song info
+                    this._updateLabelText(`${this._currentTrack.artist} - ${this._currentTrack.title}`);
+
+                    // Try to fetch lyrics if enabled
+                    if (this._showLyrics) {
+                        this._fetchLyrics(this._currentTrack.title, this._currentTrack.artist, this._currentTrack.album, this._currentTrack.duration);
+                    }
+                } else if (!this._showLyrics) {
+                    // If lyrics are disabled but track didn't change, make sure label is still correct
                     this._updateLabelText(`${this._currentTrack.artist} - ${this._currentTrack.title}`);
                 }
             } catch (e) {
@@ -493,46 +607,285 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
         }
 
-        _fetchLyrics(title, artist) {
+        _fetchLyrics(title, artist, album, duration) {
             // Clear any existing lyrics timeout
             if (this._lyricsTimeoutId) {
                 GLib.source_remove(this._lyricsTimeoutId);
                 this._lyricsTimeoutId = null;
             }
 
+            // Clear previous lyrics state
+            this._currentLyrics = null;
+            this._currentLine = '';
+
+            const cacheKey = this._getLyricsCacheKey(title, artist);
+            const cachedLyrics = this._lyricsCache.get(cacheKey);
+            if (cachedLyrics) {
+                this._touchLyricsDiskCache(cacheKey, cachedLyrics);
+                this._displayLyricsResult(cachedLyrics, title, artist);
+                return;
+            }
+
+            const diskCachedLyrics = this._readLyricsFromDiskCache(cacheKey);
+            if (diskCachedLyrics) {
+                this._lyricsCache.set(cacheKey, diskCachedLyrics);
+                this._touchLyricsDiskCache(cacheKey, diskCachedLyrics);
+                this._displayLyricsResult(diskCachedLyrics, title, artist);
+                return;
+            }
+
             // Build API URL
-            const url = `${LYRICS_API_URL}?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}`;
+            let url = `${LYRICS_API_URL}?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}`;
+            if (album && album !== 'Unknown Album') {
+                url += `&album_name=${encodeURIComponent(album)}`;
+            }
+            if (duration && duration > 0) {
+                url += `&duration=${duration}`;
+            }
 
-            const file = Gio.File.new_for_uri(url);
+            const msg = Soup.Message.new('GET', url);
 
-            file.load_contents_async(null, (source, result) => {
+            this._soupSession.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, null, (session, result) => {
+                if (this._isDestroyed) return;
                 try {
-                    const [success, contents] = source.load_contents_finish(result);
+                    const bytes = session.send_and_read_finish(result);
 
-                    if (!success) {
+                    // Check if the track has changed while we were fetching
+                    if (!this._currentTrack || this._currentTrack.title !== title || this._currentTrack.artist !== artist) {
+                        return;
+                    }
+
+                    if (msg.get_status() !== Soup.Status.OK) {
                         this._updateLabelText(`${artist} - ${title}`);
                         return;
                     }
 
                     const decoder = new TextDecoder('utf-8');
-                    const response = decoder.decode(contents);
+                    const response = decoder.decode(bytes.get_data());
                     const data = JSON.parse(response);
 
-                    if (data.syncedLyrics) {
-                        this._currentLyrics = this._parseLRC(data.syncedLyrics);
-                        this._startLyricsDisplay();
-                    } else if (data.plainLyrics) {
-                        // Fallback to plain lyrics (show first line)
-                        const firstLine = data.plainLyrics.split('\n')[0];
-                        this._updateLabelText(firstLine || `${artist} - ${title}`);
-                    } else {
-                        this._updateLabelText(`${artist} - ${title}`);
-                    }
+                    const lyricsResult = {
+                        syncedLines: data.syncedLyrics ? this._parseLRC(data.syncedLyrics) : null,
+                        plainFirstLine: data.plainLyrics ? data.plainLyrics.split('\n')[0] : null,
+                        frequency: 1
+                    };
+
+                    this._lyricsCache.set(cacheKey, lyricsResult);
+                    this._writeLyricsToDiskCache(cacheKey, lyricsResult);
+                    this._displayLyricsResult(lyricsResult, title, artist);
                 } catch (e) {
+                    // Check if track has changed
+                    if (!this._currentTrack || this._currentTrack.title !== title || this._currentTrack.artist !== artist) {
+                        return;
+                    }
                     logError(e, 'Failed to fetch lyrics');
                     this._updateLabelText(`${artist} - ${title}`);
                 }
             });
+        }
+
+        _getLyricsCacheKey(title, artist) {
+            return `${this._normalizeLyricsCachePart(artist)}::${this._normalizeLyricsCachePart(title)}`;
+        }
+
+        _normalizeLyricsCachePart(value) {
+            return value.trim().toLowerCase().replace(/\s+/g, ' ');
+        }
+
+        _initLyricsCacheDirectory() {
+            try {
+                GLib.mkdir_with_parents(this._lyricsCacheDir, 0o700);
+            } catch (e) {
+                logError(e, 'Failed to initialize lyrics cache');
+            }
+        }
+
+        _getLyricsCachePath(cacheKey) {
+            const fileName = `${GLib.compute_checksum_for_string(
+                GLib.ChecksumType.SHA256,
+                cacheKey,
+                -1
+            )}.json`;
+
+            return GLib.build_filenamev([this._lyricsCacheDir, fileName]);
+        }
+
+        _readLyricsFromDiskCache(cacheKey) {
+            try {
+                const cachePath = this._getLyricsCachePath(cacheKey);
+                const [success, contents] = GLib.file_get_contents(cachePath);
+                if (!success) {
+                    return null;
+                }
+
+                const decoder = new TextDecoder('utf-8');
+                return this._deserializeLyricsResult(decoder.decode(contents));
+            } catch (e) {
+                return null;
+            }
+        }
+
+        _touchLyricsDiskCache(cacheKey, lyricsResult) {
+            lyricsResult.frequency = (lyricsResult.frequency || 1) + 1;
+            this._writeLyricsToDiskCache(cacheKey, lyricsResult);
+        }
+
+        _writeLyricsToDiskCache(cacheKey, lyricsResult, shouldPrune = true) {
+            try {
+                this._initLyricsCacheDirectory();
+                GLib.file_set_contents(
+                    this._getLyricsCachePath(cacheKey),
+                    this._serializeLyricsResult(lyricsResult)
+                );
+                if (shouldPrune) {
+                    this._pruneLyricsCache();
+                }
+            } catch (e) {
+                logError(e, 'Failed to write lyrics cache');
+            }
+        }
+
+        _pruneLyricsCache() {
+            try {
+                const cacheDir = Gio.File.new_for_path(this._lyricsCacheDir);
+                const enumerator = cacheDir.enumerate_children(
+                    'standard::name,standard::size,time::modified',
+                    Gio.FileQueryInfoFlags.NONE,
+                    null
+                );
+
+                const entries = [];
+                let totalBytes = 0;
+                let info;
+
+                while ((info = enumerator.next_file(null)) !== null) {
+                    const name = info.get_name();
+                    if (!name.endsWith('.json')) {
+                        continue;
+                    }
+
+                    const path = GLib.build_filenamev([this._lyricsCacheDir, name]);
+                    const size = info.get_size();
+                    totalBytes += size;
+
+                    entries.push({
+                        path,
+                        size,
+                        frequency: this._readLyricsCacheFrequency(path),
+                        modified: info.get_attribute_uint64('time::modified')
+                    });
+                }
+
+                enumerator.close(null);
+
+                if (totalBytes <= LYRICS_CACHE_MAX_BYTES) {
+                    return;
+                }
+
+                entries.sort((a, b) => {
+                    if (a.frequency !== b.frequency) {
+                        return a.frequency - b.frequency;
+                    }
+                    return a.modified - b.modified;
+                });
+
+                for (const entry of entries) {
+                    if (totalBytes <= LYRICS_CACHE_MAX_BYTES) {
+                        break;
+                    }
+
+                    try {
+                        Gio.File.new_for_path(entry.path).delete(null);
+                        totalBytes -= entry.size;
+                    } catch (e) {
+                        logError(e, 'Failed to prune lyrics cache entry');
+                    }
+                }
+            } catch (e) {
+                logError(e, 'Failed to prune lyrics cache');
+            }
+        }
+
+        _readLyricsCacheFrequency(cachePath) {
+            try {
+                const [success, contents] = GLib.file_get_contents(cachePath);
+                if (!success) {
+                    return 0;
+                }
+
+                const decoder = new TextDecoder('utf-8');
+                const payload = JSON.parse(decoder.decode(contents));
+                return payload.f || 0;
+            } catch (e) {
+                return 0;
+            }
+        }
+
+        _serializeLyricsResult(lyricsResult) {
+            const payload = {
+                v: 2,
+                f: lyricsResult.frequency || 1
+            };
+
+            if (lyricsResult.syncedLines && lyricsResult.syncedLines.length > 0) {
+                let previousTime = 0;
+                payload.s = [];
+
+                for (const line of lyricsResult.syncedLines) {
+                    payload.s.push(line.time - previousTime, line.text);
+                    previousTime = line.time;
+                }
+            } else if (lyricsResult.plainFirstLine) {
+                payload.p = lyricsResult.plainFirstLine;
+            }
+
+            return JSON.stringify(payload);
+        }
+
+        _deserializeLyricsResult(serializedLyrics) {
+            const payload = JSON.parse(serializedLyrics);
+            if (payload.v !== 1 && payload.v !== 2) {
+                return null;
+            }
+
+            if (payload.v === 1) {
+                return {
+                    syncedLines: Array.isArray(payload.s)
+                        ? payload.s.map(line => ({ time: line[0], text: line[1] }))
+                        : null,
+                    plainFirstLine: payload.p || null,
+                    frequency: payload.f || 1
+                };
+            }
+
+            let runningTime = 0;
+            const syncedLines = [];
+            if (Array.isArray(payload.s)) {
+                for (let i = 0; i < payload.s.length; i += 2) {
+                    runningTime += payload.s[i];
+                    syncedLines.push({
+                        time: runningTime,
+                        text: payload.s[i + 1]
+                    });
+                }
+            }
+
+            return {
+                syncedLines: syncedLines.length > 0 ? syncedLines : null,
+                plainFirstLine: payload.p || null,
+                frequency: payload.f || 1
+            };
+        }
+
+        _displayLyricsResult(lyricsResult, title, artist) {
+            if (lyricsResult.syncedLines && lyricsResult.syncedLines.length > 0) {
+                this._currentLyrics = lyricsResult.syncedLines;
+                this._startLyricsDisplay();
+            } else if (lyricsResult.plainFirstLine) {
+                this._updateLabelText(lyricsResult.plainFirstLine);
+            } else {
+                this._updateLabelText(`${artist} - ${title}`);
+            }
         }
 
         _parseLRC(lrcText) {
@@ -567,8 +920,8 @@ const MusicLyricsIndicator = GObject.registerClass(
             // Get current playback position
             this._updateCurrentLyricLine();
 
-            // Update lyrics based on configured interval - use 500ms as default
-            this._lyricsTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            // Update lyrics based on configured interval - use 200ms to minimize lag
+            this._lyricsTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
                 this._updateCurrentLyricLine();
                 return GLib.SOURCE_CONTINUE;
             });
@@ -588,11 +941,13 @@ const MusicLyricsIndicator = GObject.registerClass(
                     -1,
                     null,
                     (proxy, result) => {
+                        if (this._isDestroyed) return;
                         try {
                             const reply = proxy.call_finish(result);
                             // Reply is a tuple containing a variant, extract the int64 value
                             const positionUs = reply.get_child_value(0).get_variant().get_int64();
-                            const positionMs = positionUs / 1000; // Convert microseconds to milliseconds
+                            // Convert microseconds to milliseconds and add user offset
+                            const positionMs = (positionUs / 1000) + this._lyricsOffset;
 
                             // Find the current lyric line
                             let currentLine = this._currentLyrics[0].text;
@@ -624,8 +979,7 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
 
             const display = this._currentText || 'No music playing';
-            const maxLength = this._settings.get_int('max-text-length');
-            this._label.set_text(this._truncateText(display, maxLength));
+            this._label.set_text(this._truncateText(display, this._maxLength));
         }
 
         _truncateText(text, maxLength) {
@@ -636,9 +990,16 @@ const MusicLyricsIndicator = GObject.registerClass(
         }
 
         destroy() {
+            this._isDestroyed = true;
+
             if (this._settingsSignalId) {
                 this._settings.disconnect(this._settingsSignalId);
                 this._settingsSignalId = null;
+            }
+
+            if (this._offsetSignalId) {
+                this._settings.disconnect(this._offsetSignalId);
+                this._offsetSignalId = null;
             }
 
             if (this._lyricsTimeoutId) {
@@ -651,11 +1012,20 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._propertiesChangedId = null;
             }
 
-            if (this._busWatchId) {
-                Gio.bus_unwatch_name(this._busWatchId);
-                this._busWatchId = null;
+            if (this._nameOwnerChangedId && this._dbusProxy) {
+                this._dbusProxy.disconnect(this._nameOwnerChangedId);
+                this._nameOwnerChangedId = null;
             }
 
+            if (this._propertiesSubscriptionId) {
+                try {
+                    const connection = Gio.bus_get_sync(Gio.BusType.SESSION, null);
+                    connection.signal_unsubscribe(this._propertiesSubscriptionId);
+                } catch (e) { }
+                this._propertiesSubscriptionId = null;
+            }
+
+            this._dbusProxy = null;
             this._proxy = null;
             this._playerProxy = null;
             super.destroy();

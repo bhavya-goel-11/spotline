@@ -17,5 +17,11 @@
       <summary>Max Text Length</summary>
       <description>Maximum capacity of text to display</description>
     </key>
+    <key name="lyrics-offset" type="i">
+      <default>400</default>
+      <range min="-2000" max="2000"/>
+      <summary>Lyrics Lookahead Offset</summary>
+      <description>Time in milliseconds to show lyrics before they are sung</description>
+    </key>
   </schema>
 </schemalist>

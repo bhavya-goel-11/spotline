@@ -45,6 +45,24 @@ export default class SpotLinePreferences extends ExtensionPreferences {
 
         group.add(widthRow);
 
+        // Lyrics Offset setting
+        const offsetRow = new Adw.SpinRow({
+            title: 'Lyrics Lookahead (ms)',
+            subtitle: 'Time to show lyrics before they are sung (helps you sing along)',
+            adjustment: new Gtk.Adjustment({
+                lower: -2000,
+                upper: 2000,
+                step_increment: 100,
+                value: settings.get_int('lyrics-offset')
+            })
+        });
+
+        offsetRow.connect('notify::value', () => {
+            settings.set_int('lyrics-offset', offsetRow.get_value());
+        });
+
+        group.add(offsetRow);
+
         page.add(group);
         window.add(page);
     }
