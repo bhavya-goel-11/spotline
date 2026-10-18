@@ -3,6 +3,7 @@ import St from 'gi://St';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
+import Pango from 'gi://Pango';
 import Soup from 'gi://Soup';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -14,7 +15,10 @@ const MPRIS_PLAYER_INTERFACE = 'org.mpris.MediaPlayer2.Player';
 
 // Lyrics API configuration
 const LYRICS_API_URL = 'https://lrclib.net/api/get';
+const LYRICS_SEARCH_URL = 'https://lrclib.net/api/search';
+const LYRICS_DURATION_TOLERANCE_S = 5;
 const LYRICS_CACHE_MAX_BYTES = 10 * 1024 * 1024;
+const LYRICS_CACHE_PRUNE_INTERVAL_US = 10 * 60 * GLib.USEC_PER_SEC;
 
 // Helper function to check if a bus name is a supported music player
 function isSupportedPlayer(busName) {
@@ -26,15 +30,43 @@ function isSupportedPlayer(busName) {
 
     // Browser-based players (chromium, chrome, firefox, etc.)
     // These have instance IDs like: org.mpris.MediaPlayer2.chromium.instance12345
-    const browserPatterns = [
-        /^org\.mpris\.MediaPlayer2\.chromium\.instance\d+$/,
-        /^org\.mpris\.MediaPlayer2\.chrome\.instance\d+$/,
-        /^org\.mpris\.MediaPlayer2\.firefox\.instance\d+$/,
-        /^org\.mpris\.MediaPlayer2\.brave\.instance\d+$/,
-        /^org\.mpris\.MediaPlayer2\.edge\.instance\d+$/
-    ];
+    // or, for the Firefox snap: org.mpris.MediaPlayer2.firefox.instance_1_42
+    return /^org\.mpris\.MediaPlayer2\.(chromium|chrome|firefox|brave|edge)\.instance[\w.]+$/.test(busName);
+}
 
-    return browserPatterns.some(pattern => pattern.test(busName));
+// Promise wrapper around Gio.DBusProxy.new_for_bus so we never block the shell
+function newProxyAsync(busName, iface) {
+    return new Promise((resolve, reject) => {
+        Gio.DBusProxy.new_for_bus(
+            Gio.BusType.SESSION,
+            Gio.DBusProxyFlags.NONE,
+            null,
+            busName,
+            MPRIS_PLAYER_PATH,
+            iface,
+            null,
+            (source, result) => {
+                try {
+                    resolve(Gio.DBusProxy.new_for_bus_finish(result));
+                } catch (e) {
+                    reject(e);
+                }
+            }
+        );
+    });
+}
+
+// Promise wrapper around Gio.DBusProxy.call
+function callAsync(proxy, method, params = null, timeout = -1) {
+    return new Promise((resolve, reject) => {
+        proxy.call(method, params, Gio.DBusCallFlags.NONE, timeout, null, (p, result) => {
+            try {
+                resolve(p.call_finish(result));
+            } catch (e) {
+                reject(e);
+            }
+        });
+    });
 }
 
 const MusicLyricsIndicator = GObject.registerClass(
@@ -56,7 +88,7 @@ const MusicLyricsIndicator = GObject.registerClass(
             });
 
             // Enable text clipping with ellipsis
-            this._label.clutter_text.ellipsize = 3; // PANGO_ELLIPSIZE_END
+            this._label.clutter_text.ellipsize = Pango.EllipsizeMode.END;
 
             // Info icon button
             this._infoIcon = new St.Icon({
@@ -103,7 +135,10 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._proxy = null;
             this._propertiesChangedId = null;
             this._lyricsTimeoutId = null;
+            this._playerProxy = null;
             this._currentBusName = null;
+            this._findGeneration = 0;
+            this._lastPruneTime = 0;
             this._dbusProxy = null;
             this._nameOwnerChangedId = null;
             this._propertiesSubscriptionId = null;
@@ -127,6 +162,7 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._lyricsOffset = this._settings.get_int('lyrics-offset');
             });
 
+            this.menu.box.add_style_class_name('spotline-menu');
             this._buildMenu();
             this._initLyricsCacheDirectory();
             this._setupDBusMonitoring();
@@ -144,45 +180,43 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._trackInfoItem = new PopupMenu.PopupMenuItem('No track playing', {
                 reactive: false
             });
+            // Wrap long names inside the fixed-width menu instead of widening it
+            this._trackInfoItem.label.x_expand = true;
+            this._trackInfoItem.label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+            this._trackInfoItem.label.clutter_text.line_wrap = true;
+            this._trackInfoItem.label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
             this.menu.addMenuItem(this._trackInfoItem);
 
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
             // Playback controls
             const controlsBox = new St.BoxLayout({
-                style_class: 'popup-menu-item',
                 x_expand: true,
                 x_align: Clutter.ActorAlign.CENTER,
                 style: 'spacing: 12px;'
             });
 
-            const prevButton = new St.Button({
-                style_class: 'button',
-                child: new St.Icon({
-                    icon_name: 'media-skip-backward-symbolic',
-                    icon_size: 20
-                })
-            });
-            prevButton.connect('clicked', () => this._controlPlayback('Previous'));
+            const makeControlButton = (iconName, action) => {
+                const button = new St.Button({
+                    style_class: 'button',
+                    reactive: true,
+                    can_focus: true,
+                    track_hover: true,
+                    child: new St.Icon({
+                        icon_name: iconName,
+                        icon_size: 20
+                    })
+                });
+                button.connect('clicked', () => this._controlPlayback(action));
+                return button;
+            };
 
-            const playPauseButton = new St.Button({
-                style_class: 'button',
-                child: new St.Icon({
-                    icon_name: 'media-playback-start-symbolic',
-                    icon_size: 20
-                })
-            });
+            const prevButton = makeControlButton('media-skip-backward-symbolic', 'Previous');
+            const playPauseButton = makeControlButton('media-playback-start-symbolic', 'PlayPause');
+            const nextButton = makeControlButton('media-skip-forward-symbolic', 'Next');
+            this._prevButton = prevButton;
             this._playPauseButton = playPauseButton;
-            playPauseButton.connect('clicked', () => this._controlPlayback('PlayPause'));
-
-            const nextButton = new St.Button({
-                style_class: 'button',
-                child: new St.Icon({
-                    icon_name: 'media-skip-forward-symbolic',
-                    icon_size: 20
-                })
-            });
-            nextButton.connect('clicked', () => this._controlPlayback('Next'));
+            this._nextButton = nextButton;
 
             controlsBox.add_child(prevButton);
             controlsBox.add_child(playPauseButton);
@@ -252,31 +286,37 @@ const MusicLyricsIndicator = GObject.registerClass(
 
         _controlPlayback(action) {
             if (!this._playerProxy) {
+                this._findActivePlayer();
                 return;
             }
 
-            try {
-                this._playerProxy.call(
-                    action,
-                    null,
-                    Gio.DBusCallFlags.NONE,
-                    -1,
-                    null,
-                    (proxy, result) => {
-                        try {
-                            proxy.call_finish(result);
-                        } catch (e) {
-                            logError(e, `Failed to execute ${action}`);
-                        }
-                    }
-                );
-            } catch (e) {
-                logError(e, `Failed to call ${action}`);
+            // Flip the icon right away instead of waiting for the player's PropertiesChanged round trip
+            if (action === 'PlayPause') {
+                this._playPauseButton.child.icon_name = this._isCurrentlyPlaying()
+                    ? 'media-playback-start-symbolic'
+                    : 'media-playback-pause-symbolic';
             }
+
+            callAsync(this._playerProxy, action).catch(e => {
+                logError(e, `Failed to execute ${action}`);
+                this._updatePlayPauseButton();
+            });
+        }
+
+        _getCachedBool(name, fallback = true) {
+            const value = this._playerProxy?.get_cached_property(name);
+            return value ? value.unpack() : fallback;
         }
 
         _updatePlayPauseButton() {
-            if (!this._playerProxy || !this._playPauseButton) {
+            if (!this._playPauseButton) {
+                return;
+            }
+
+            if (!this._playerProxy) {
+                this._playPauseButton.child.icon_name = 'media-playback-start-symbolic';
+                this._prevButton.reactive = false;
+                this._nextButton.reactive = false;
                 return;
             }
 
@@ -287,9 +327,20 @@ const MusicLyricsIndicator = GObject.registerClass(
                     const icon = status === 'Playing' ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic';
                     this._playPauseButton.child.icon_name = icon;
                 }
+
+                // Grey out skip buttons when the player reports it can't skip
+                this._prevButton.reactive = this._getCachedBool('CanGoPrevious');
+                this._nextButton.reactive = this._getCachedBool('CanGoNext');
+                this._prevButton.opacity = this._prevButton.reactive ? 255 : 100;
+                this._nextButton.opacity = this._nextButton.reactive ? 255 : 100;
             } catch (e) {
-                logError(e, 'Failed to update play/pause button');
+                logError(e, 'Failed to update playback controls');
             }
+        }
+
+        _isCurrentlyPlaying() {
+            const status = this._playerProxy?.get_cached_property('PlaybackStatus');
+            return status ? status.unpack() === 'Playing' : true;
         }
 
         _setupDBusMonitoring() {
@@ -308,6 +359,10 @@ const MusicLyricsIndicator = GObject.registerClass(
                     if (signalName === 'NameOwnerChanged') {
                         const [name, oldOwner, newOwner] = parameters.deep_unpack();
                         if (name.startsWith('org.mpris.MediaPlayer2.')) {
+                            // Our player went away: drop it so we stop polling a dead name
+                            if (name === this._currentBusName && !newOwner) {
+                                this._disconnectPlayer();
+                            }
                             this._findActivePlayer();
                         }
                     }
@@ -329,7 +384,8 @@ const MusicLyricsIndicator = GObject.registerClass(
                                 // If playback status changes to Playing on any player, re-evaluate
                                 if (changedProps['PlaybackStatus']) {
                                     const status = changedProps['PlaybackStatus'].deep_unpack();
-                                    if (status === 'Playing') {
+                                    // Resuming the player we're already on needs no rescan
+                                    if (status === 'Playing' && sender !== this._playerProxy?.g_name_owner) {
                                         this._findActivePlayer();
                                     }
                                 }
@@ -346,129 +402,110 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._findActivePlayer();
         }
 
-        _findActivePlayer() {
+        async _findActivePlayer() {
+            // Only the most recent search is allowed to switch players
+            const generation = ++this._findGeneration;
+
             try {
-                const dbusProxy = Gio.DBusProxy.new_for_bus_sync(
-                    Gio.BusType.SESSION,
-                    Gio.DBusProxyFlags.NONE,
-                    null,
-                    'org.freedesktop.DBus',
-                    '/org/freedesktop/DBus',
-                    'org.freedesktop.DBus',
-                    null
-                );
+                const reply = await callAsync(this._dbusProxy, 'ListNames');
+                if (this._isDestroyed || generation !== this._findGeneration) return;
 
-                dbusProxy.call(
-                    'ListNames',
-                    null,
-                    Gio.DBusCallFlags.NONE,
-                    -1,
-                    null,
-                    (proxy, result) => {
-                        if (this._isDestroyed) return;
-                        try {
-                            const reply = proxy.call_finish(result);
-                            const names = reply.get_child_value(0).deep_unpack();
+                const names = reply.get_child_value(0).deep_unpack().filter(isSupportedPlayer);
 
-                            // First try to find a playing supported player
-                            let foundPlayer = null;
+                // Prefer a player that is actually playing
+                const statuses = await Promise.all(names.map(name => this._getPlaybackStatus(name)));
+                if (this._isDestroyed || generation !== this._findGeneration) return;
 
-                            for (const name of names) {
-                                if (isSupportedPlayer(name)) {
-                                    if (this._isPlayerPlaying(name)) {
-                                        foundPlayer = name;
-                                        break;
-                                    }
-                                }
-                            }
+                const playingIndex = statuses.indexOf('Playing');
+                let foundPlayer = playingIndex >= 0 ? names[playingIndex] : null;
 
-                            // If no playing player, connect to any supported player
-                            if (!foundPlayer) {
-                                for (const name of names) {
-                                    if (isSupportedPlayer(name)) {
-                                        foundPlayer = name;
-                                        break;
-                                    }
-                                }
-                            }
+                // Otherwise stay on the current player if it's still around, else take any
+                if (!foundPlayer) {
+                    foundPlayer = names.includes(this._currentBusName)
+                        ? this._currentBusName
+                        : names[0] ?? null;
+                }
 
-                            if (foundPlayer) {
-                                this._tryConnectToPlayer(foundPlayer);
-                            } else {
-                                this._updateLabelText('No music playing');
-                            }
-                        } catch (e) {
-                            logError(e, 'Failed to list DBus names');
-                            this._updateLabelText('No music playing');
-                        }
-                    }
-                );
-            } catch (e) {
-                logError(e, 'Failed to query DBus');
-                this._updateLabelText('No music playing');
-            }
-        }
-
-        _isPlayerPlaying(busName) {
-            try {
-                const playerProxy = Gio.DBusProxy.new_for_bus_sync(
-                    Gio.BusType.SESSION,
-                    Gio.DBusProxyFlags.NONE,
-                    null,
-                    busName,
-                    MPRIS_PLAYER_PATH,
-                    MPRIS_PLAYER_INTERFACE,
-                    null
-                );
-
-                const playbackStatus = playerProxy.get_cached_property('PlaybackStatus');
-                if (playbackStatus) {
-                    const status = playbackStatus.unpack();
-                    return status === 'Playing';
+                if (foundPlayer) {
+                    await this._tryConnectToPlayer(foundPlayer, generation);
+                } else {
+                    this._disconnectPlayer();
+                    this._updateLabelText('No music playing');
                 }
             } catch (e) {
-                // Ignore errors, player might not be available
+                logError(e, 'Failed to find active player');
             }
-            return false;
         }
 
-        _tryConnectToPlayer(busName) {
-            if (this._currentBusName === busName) {
+        async _getPlaybackStatus(busName) {
+            try {
+                const reply = await new Promise((resolve, reject) => {
+                    Gio.DBus.session.call(
+                        busName,
+                        MPRIS_PLAYER_PATH,
+                        'org.freedesktop.DBus.Properties',
+                        'Get',
+                        new GLib.Variant('(ss)', [MPRIS_PLAYER_INTERFACE, 'PlaybackStatus']),
+                        null,
+                        Gio.DBusCallFlags.NONE,
+                        1000,
+                        null,
+                        (conn, result) => {
+                            try {
+                                resolve(conn.call_finish(result));
+                            } catch (e) {
+                                reject(e);
+                            }
+                        }
+                    );
+                });
+                return reply.get_child_value(0).get_variant().unpack();
+            } catch (e) {
+                // Player might not be available
+                return null;
+            }
+        }
+
+        _disconnectPlayer() {
+            if (this._lyricsTimeoutId) {
+                GLib.source_remove(this._lyricsTimeoutId);
+                this._lyricsTimeoutId = null;
+            }
+
+            if (this._propertiesChangedId && this._playerProxy) {
+                this._playerProxy.disconnect(this._propertiesChangedId);
+            }
+            this._propertiesChangedId = null;
+            this._proxy = null;
+            this._playerProxy = null;
+            this._currentBusName = null;
+            this._currentTrack = null;
+            this._currentLyrics = null;
+            this._currentLine = '';
+
+            this._updatePlayerInfo();
+            this._trackInfoItem.label.text = 'No track playing';
+            this._updatePlayPauseButton();
+        }
+
+        async _tryConnectToPlayer(busName, generation) {
+            if (this._currentBusName === busName && this._playerProxy) {
                 return true;
             }
 
             try {
-                // Create proxy for properties interface
-                const proxy = Gio.DBusProxy.new_for_bus_sync(
-                    Gio.BusType.SESSION,
-                    Gio.DBusProxyFlags.NONE,
-                    null,
-                    busName,
-                    MPRIS_PLAYER_PATH,
-                    'org.freedesktop.DBus.Properties',
-                    null
-                );
+                // Properties proxy (for Position) and player proxy (for metadata/controls)
+                const [proxy, playerProxy] = await Promise.all([
+                    newProxyAsync(busName, 'org.freedesktop.DBus.Properties'),
+                    newProxyAsync(busName, MPRIS_PLAYER_INTERFACE)
+                ]);
+                if (this._isDestroyed || generation !== this._findGeneration) return false;
 
-                // Create proxy for player interface to monitor changes
-                const playerProxy = Gio.DBusProxy.new_for_bus_sync(
-                    Gio.BusType.SESSION,
-                    Gio.DBusProxyFlags.NONE,
-                    null,
-                    busName,
-                    MPRIS_PLAYER_PATH,
-                    MPRIS_PLAYER_INTERFACE,
-                    null
-                );
-
-                // Disconnect previous player if any
-                if (this._propertiesChangedId && this._playerProxy) {
-                    this._playerProxy.disconnect(this._propertiesChangedId);
-                }
+                this._disconnectPlayer();
 
                 this._proxy = proxy;
                 this._playerProxy = playerProxy;
                 this._currentBusName = busName;
-                this._currentTrack = null;
 
                 this._propertiesChangedId = this._playerProxy.connect(
                     'g-properties-changed',
@@ -476,9 +513,11 @@ const MusicLyricsIndicator = GObject.registerClass(
                 );
 
                 this._updatePlayerInfo();
+                this._updatePlayPauseButton();
                 this._updateTrackInfo();
                 return true;
             } catch (e) {
+                logError(e, `Failed to connect to ${busName}`);
                 return false;
             }
         }
@@ -518,9 +557,14 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._playerInfoItem.label.text = `${playerIcon} Playing from ${playerName}`;
         }
 
-        _onPropertiesChanged() {
+        _onPropertiesChanged(proxy, changed) {
             this._updateTrackInfo();
             this._updatePlayPauseButton();
+
+            // Resync the lyric line right away on resume/seek instead of waiting for the next tick
+            if (changed.lookup_value('PlaybackStatus', null)) {
+                this._updateCurrentLyricLine();
+            }
         }
 
         _updateTrackInfo(forceFetch = false) {
@@ -634,53 +678,100 @@ const MusicLyricsIndicator = GObject.registerClass(
                 return;
             }
 
-            // Build API URL
-            let url = `${LYRICS_API_URL}?artist_name=${encodeURIComponent(artist)}&track_name=${encodeURIComponent(title)}`;
-            if (album && album !== 'Unknown Album') {
-                url += `&album_name=${encodeURIComponent(album)}`;
-            }
-            if (duration && duration > 0) {
-                url += `&duration=${duration}`;
-            }
+            const isStillCurrent = () => !this._isDestroyed &&
+                this._currentTrack &&
+                this._currentTrack.title === title &&
+                this._currentTrack.artist === artist;
 
-            const msg = Soup.Message.new('GET', url);
+            this._lookupLyrics(title, artist, album, duration, isStillCurrent).then(data => {
+                if (!isStillCurrent()) return;
 
-            this._soupSession.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, null, (session, result) => {
-                if (this._isDestroyed) return;
-                try {
-                    const bytes = session.send_and_read_finish(result);
-
-                    // Check if the track has changed while we were fetching
-                    if (!this._currentTrack || this._currentTrack.title !== title || this._currentTrack.artist !== artist) {
-                        return;
-                    }
-
-                    if (msg.get_status() !== Soup.Status.OK) {
-                        this._updateLabelText(`${artist} - ${title}`);
-                        return;
-                    }
-
-                    const decoder = new TextDecoder('utf-8');
-                    const response = decoder.decode(bytes.get_data());
-                    const data = JSON.parse(response);
-
-                    const lyricsResult = {
-                        syncedLines: data.syncedLyrics ? this._parseLRC(data.syncedLyrics) : null,
-                        plainFirstLine: data.plainLyrics ? data.plainLyrics.split('\n')[0] : null,
-                        frequency: 1
-                    };
-
-                    this._lyricsCache.set(cacheKey, lyricsResult);
-                    this._writeLyricsToDiskCache(cacheKey, lyricsResult);
-                    this._displayLyricsResult(lyricsResult, title, artist);
-                } catch (e) {
-                    // Check if track has changed
-                    if (!this._currentTrack || this._currentTrack.title !== title || this._currentTrack.artist !== artist) {
-                        return;
-                    }
-                    logError(e, 'Failed to fetch lyrics');
+                if (!data) {
                     this._updateLabelText(`${artist} - ${title}`);
+                    return;
                 }
+
+                const lyricsResult = {
+                    syncedLines: data.syncedLyrics ? this._parseLRC(data.syncedLyrics) : null,
+                    plainFirstLine: data.plainLyrics ? data.plainLyrics.split('\n')[0] : null,
+                    frequency: 1
+                };
+
+                this._lyricsCache.set(cacheKey, lyricsResult);
+                this._writeLyricsToDiskCache(cacheKey, lyricsResult);
+                this._displayLyricsResult(lyricsResult, title, artist);
+            }).catch(e => {
+                if (!isStillCurrent()) return;
+                logError(e, 'Failed to fetch lyrics');
+                this._updateLabelText(`${artist} - ${title}`);
+            });
+        }
+
+        // lrclib's /get endpoint needs an exact match on every field, and players often
+        // report only the first artist or a slightly different album name. Try the
+        // strict lookup first, then progressively looser ones.
+        async _lookupLyrics(title, artist, album, duration, isStillCurrent) {
+            const hasLyrics = data => data && (data.syncedLyrics || data.plainLyrics);
+            const params = {artist_name: artist, track_name: title};
+            if (duration > 0) {
+                params.duration = duration;
+            }
+
+            const attempts = [];
+            if (album && album !== 'Unknown Album') {
+                attempts.push({...params, album_name: album});
+            }
+            attempts.push(params);
+
+            for (const query of attempts) {
+                // eslint-disable-next-line no-await-in-loop
+                const data = await this._requestJson(LYRICS_API_URL, query);
+                if (!isStillCurrent()) return null;
+                if (hasLyrics(data)) {
+                    return data;
+                }
+            }
+
+            // Last resort: fuzzy search, preferring synced lyrics with the closest duration
+            const results = await this._requestJson(LYRICS_SEARCH_URL, {artist_name: artist, track_name: title});
+            if (!Array.isArray(results)) {
+                return null;
+            }
+
+            const candidates = results.filter(r => hasLyrics(r) &&
+                (!(duration > 0) || !r.duration || Math.abs(r.duration - duration) <= LYRICS_DURATION_TOLERANCE_S));
+            candidates.sort((a, b) => {
+                if (!!a.syncedLyrics !== !!b.syncedLyrics) {
+                    return a.syncedLyrics ? -1 : 1;
+                }
+                return Math.abs((a.duration || duration) - duration) - Math.abs((b.duration || duration) - duration);
+            });
+
+            return candidates[0] ?? null;
+        }
+
+        // Returns parsed JSON for a 200 response, null for anything else
+        _requestJson(baseUrl, query) {
+            const queryString = Object.entries(query)
+                .map(([key, value]) => `${key}=${encodeURIComponent(value)}`)
+                .join('&');
+            const msg = Soup.Message.new('GET', `${baseUrl}?${queryString}`);
+
+            return new Promise((resolve, reject) => {
+                this._soupSession.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, null, (session, result) => {
+                    try {
+                        const bytes = session.send_and_read_finish(result);
+                        if (msg.get_status() !== Soup.Status.OK) {
+                            resolve(null);
+                            return;
+                        }
+
+                        const decoder = new TextDecoder('utf-8');
+                        resolve(JSON.parse(decoder.decode(bytes.get_data())));
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
             });
         }
 
@@ -727,7 +818,8 @@ const MusicLyricsIndicator = GObject.registerClass(
 
         _touchLyricsDiskCache(cacheKey, lyricsResult) {
             lyricsResult.frequency = (lyricsResult.frequency || 1) + 1;
-            this._writeLyricsToDiskCache(cacheKey, lyricsResult);
+            // Rewriting an existing entry barely changes the cache size, so skip pruning
+            this._writeLyricsToDiskCache(cacheKey, lyricsResult, false);
         }
 
         _writeLyricsToDiskCache(cacheKey, lyricsResult, shouldPrune = true) {
@@ -746,6 +838,13 @@ const MusicLyricsIndicator = GObject.registerClass(
         }
 
         _pruneLyricsCache() {
+            // Scanning thousands of files is expensive; do it at most every 10 minutes
+            const now = GLib.get_monotonic_time();
+            if (now - this._lastPruneTime < LYRICS_CACHE_PRUNE_INTERVAL_US) {
+                return;
+            }
+            this._lastPruneTime = now;
+
             try {
                 const cacheDir = Gio.File.new_for_path(this._lyricsCacheDir);
                 const enumerator = cacheDir.enumerate_children(
@@ -771,7 +870,6 @@ const MusicLyricsIndicator = GObject.registerClass(
                     entries.push({
                         path,
                         size,
-                        frequency: this._readLyricsCacheFrequency(path),
                         modified: info.get_attribute_uint64('time::modified')
                     });
                 }
@@ -780,6 +878,11 @@ const MusicLyricsIndicator = GObject.registerClass(
 
                 if (totalBytes <= LYRICS_CACHE_MAX_BYTES) {
                     return;
+                }
+
+                // Only read each file's frequency once we know we have to evict
+                for (const entry of entries) {
+                    entry.frequency = this._readLyricsCacheFrequency(entry.path);
                 }
 
                 entries.sort((a, b) => {
@@ -922,7 +1025,10 @@ const MusicLyricsIndicator = GObject.registerClass(
 
             // Update lyrics based on configured interval - use 200ms to minimize lag
             this._lyricsTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
-                this._updateCurrentLyricLine();
+                // No need to poll the position while paused
+                if (this._isCurrentlyPlaying()) {
+                    this._updateCurrentLyricLine();
+                }
                 return GLib.SOURCE_CONTINUE;
             });
         }
@@ -941,7 +1047,7 @@ const MusicLyricsIndicator = GObject.registerClass(
                     -1,
                     null,
                     (proxy, result) => {
-                        if (this._isDestroyed) return;
+                        if (this._isDestroyed || proxy !== this._proxy || !this._currentLyrics) return;
                         try {
                             const reply = proxy.call_finish(result);
                             // Reply is a tuple containing a variant, extract the int64 value
@@ -1025,6 +1131,8 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._propertiesSubscriptionId = null;
             }
 
+            this._soupSession.abort();
+
             this._dbusProxy = null;
             this._proxy = null;
             this._playerProxy = null;
@@ -1041,12 +1149,13 @@ export default class MusicLyricsExtension extends Extension {
 
     enable() {
         this._settings = this.getSettings();
-        this._indicator = new MusicLyricsIndicator(this._settings);
+        this._createIndicator();
 
-        this._updatePosition();
-
+        // Moving an indicator between panel boxes isn't supported by the panel API,
+        // so rebuild it in the new position
         this._settingsSignalId = this._settings.connect('changed::position-in-panel', () => {
-            this._updatePosition();
+            this._destroyIndicator();
+            this._createIndicator();
         });
     }
 
@@ -1056,36 +1165,59 @@ export default class MusicLyricsExtension extends Extension {
             this._settingsSignalId = null;
         }
 
-        if (this._indicator) {
-            this._indicator.destroy();
-            this._indicator = null;
-        }
-
+        this._destroyIndicator();
         this._settings = null;
     }
 
-    _updatePosition() {
-        if (!this._indicator) return;
-
-        // Remove from current parent if applied
-        if (this._indicator.get_parent()) {
-            this._indicator.get_parent().remove_child(this._indicator);
-        }
+    _createIndicator() {
+        this._indicator = new MusicLyricsIndicator(this._settings);
 
         const position = this._settings.get_string('position-in-panel');
+        const box = position === 'left-half' ? 'left' : ['left', 'center'].includes(position) ? position : 'right';
+        // Place after existing items on the left, before them elsewhere
+        const index = box === 'left' ? Main.panel._leftBox.get_n_children() : 0;
 
-        if (position === 'left') {
-            Main.panel._leftBox.add_child(this._indicator);
-        } else if (position === 'center') {
-            Main.panel._centerBox.add_child(this._indicator);
-        } else {
-            // Default to right (status area)
-            // We use addToStatusArea but need to handle re-adding carefully
-            // addToStatusArea destroys existing indicator with same role, but we handle that
+        // addToStatusArea registers the menu with the panel's menu manager,
+        // which is what gives the popup its input grab and keyboard focus
+        Main.panel.addToStatusArea(this.uuid, this._indicator, index, box);
 
-            // Since we manually removed it, we can just add it back using the panel method
-            // or just use addToStatusArea again (which is safer for right side)
-            Main.panel.addToStatusArea('music-lyrics-indicator', this._indicator);
+        if (position === 'left-half') {
+            // The panel boxes can't place an item at an arbitrary point, so keep it in the
+            // left box and slide it over visually. Translation doesn't affect layout, and
+            // both input picking and the menu's anchor follow the transformed position.
+            const container = this._indicator.container;
+            this._allocationId = container.connect('notify::allocation', () => this._centerInLeftHalf());
+            this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => this._centerInLeftHalf());
+        }
+    }
+
+    _centerInLeftHalf() {
+        const container = this._indicator?.container;
+        const monitor = Main.layoutManager.primaryMonitor;
+        if (!container || !monitor) {
+            return;
+        }
+
+        const [stageX] = container.get_transformed_position();
+        const naturalX = stageX - container.translation_x;
+        const targetX = monitor.x + monitor.width * 0.25 - container.width / 2;
+        // Only ever move right, so it can't slide over the Activities button
+        container.translation_x = Math.round(Math.max(0, targetX - naturalX));
+    }
+
+    _destroyIndicator() {
+        if (this._monitorsChangedId) {
+            Main.layoutManager.disconnect(this._monitorsChangedId);
+            this._monitorsChangedId = null;
+        }
+        if (this._allocationId) {
+            this._indicator?.container.disconnect(this._allocationId);
+            this._allocationId = null;
+        }
+
+        if (this._indicator) {
+            this._indicator.destroy();
+            this._indicator = null;
         }
     }
 }

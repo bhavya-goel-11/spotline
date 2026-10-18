@@ -2,13 +2,14 @@
 <schemalist>
   <schema id="org.gnome.shell.extensions.spotify-lyrics" path="/org/gnome/shell/extensions/spotify-lyrics/">
     <key name="position-in-panel" type="s">
-      <default>'right'</default>
+      <default>'left-half'</default>
       <summary>Position in Panel</summary>
-      <description>Where to place the indicator in the panel (left, center, right)</description>
+      <description>Where to place the indicator in the panel (left, center, right, left-half)</description>
       <choices>
         <choice value='left'/>
         <choice value='center'/>
         <choice value='right'/>
+        <choice value='left-half'/>
       </choices>
     </key>
     <key name="max-text-length" type="i">

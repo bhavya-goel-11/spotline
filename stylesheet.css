@@ -2,7 +2,13 @@
     font-size: 13px;
     font-weight: 500;
     padding: 0 12px;
-    max-width: 600px;
+    /* Fixed width so the indicator never shifts or resizes between songs/lyric lines */
+    width: 320px;
     text-align: center;
     color: #ffffff;
+}
+
+/* Fixed-width dropdown; long track names wrap instead of stretching it */
+.spotline-menu {
+    width: 300px;
 }

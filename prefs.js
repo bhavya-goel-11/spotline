@@ -13,12 +13,12 @@ export default class SpotLinePreferences extends ExtensionPreferences {
         const positionRow = new Adw.ComboRow({
             title: 'Panel Position',
             model: new Gtk.StringList({
-                strings: ['Left', 'Center', 'Right']
+                strings: ['Left', 'Center', 'Right', 'Middle of Left Half']
             })
         });
 
         // Map config values to combo index
-        const positions = ['left', 'center', 'right'];
+        const positions = ['left', 'center', 'right', 'left-half'];
         positionRow.selected = positions.indexOf(settings.get_string('position-in-panel'));
 
         positionRow.connect('notify::selected', () => {
