@@ -33,6 +33,11 @@
       <summary>Sharper Album Art</summary>
       <description>When a player only provides a small cover, look for a larger copy on Apple's iTunes service, which sends it the song's title and artist</description>
     </key>
+    <key name="toggle-menu-shortcut" type="as">
+      <default><![CDATA[['<Super>z']]]></default>
+      <summary>Dropdown Shortcut</summary>
+      <description>Keyboard shortcut that opens or closes the dropdown</description>
+    </key>
     <key name="refresh-player-request" type="i">
       <default>0</default>
       <summary>Refresh Player request</summary>

@@ -6,6 +6,7 @@ import Clutter from 'gi://Clutter';
 import GdkPixbuf from 'gi://GdkPixbuf';
 import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
+import Shell from 'gi://Shell';
 import Soup from 'gi://Soup';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -22,9 +23,6 @@ const LABEL_MIN_FONT_PX = 11;
 // Left-half mode: room left before the clock, and a floor for odd panel layouts
 const CLOCK_GAP_PX = 8;
 const LABEL_MIN_FILL_WIDTH_PX = 200;
-// Dropdown width its stylesheet sizes are for (the default 344px label in its
-// panel button); a wider dropdown scales its text, padding and buttons up to match
-const CARD_BASE_WIDTH_PX = 368;
 // Space kept above and below the dropdown when the square would not fit on screen
 const MENU_SCREEN_MARGIN_PX = 24;
 const MPRIS_PLAYER_INTERFACE = 'org.mpris.MediaPlayer2.Player';
@@ -390,8 +388,6 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._artLyricsShade.height = Math.round(card.width * 0.42);
                 bottomShade.height = Math.round(card.width * 0.65);
             });
-            // From the allocation, as width reports the natural size while a layout is pending
-            card.connect('notify::allocation', () => this._scaleCardContent(card.allocation.get_width()));
 
             // Upcoming lyric at the top of the cover (the current one is in the
             // top bar); on each new line it slides up out of the cover, towards the bar
@@ -478,36 +474,6 @@ const MusicLyricsIndicator = GObject.registerClass(
             content.add_child(controlsBox);
 
             card.add_child(content);
-            this._cardContent = content;
-            this._controlsBox = controlsBox;
-            this._cardScale = 1;
-        }
-
-        // Scales what sits on the card with its width, from the stylesheet's sizes
-        // (mirrored here) at CARD_BASE_WIDTH_PX
-        _scaleCardContent(width) {
-            const scale = Math.max(1, width / CARD_BASE_WIDTH_PX);
-            if (Math.abs(scale - this._cardScale) < 0.01) {
-                return;
-            }
-            this._cardScale = scale;
-            const px = v => `${Math.round(v * scale)}px`;
-
-            // The track title and artist inherit the content's font, so a percentage
-            // scales them from whatever the theme gives the menu
-            this._cardContent.style =
-                `font-size: ${Math.round(scale * 100)}%; padding: ${px(14)} ${px(18)} ${px(16)}; spacing: ${px(12)};`;
-            this._trackArtistLabel.style = `padding-top: ${px(2)};`;
-            this._controlsBox.style = `spacing: ${px(12)};`;
-            for (const button of [this._prevButton, this._playPauseButton, this._nextButton]) {
-                button.style = `padding: ${px(8)} ${px(22)};`;
-                button.child.icon_size = Math.round(20 * scale);
-            }
-            this._artLyricsBox.style = `padding: ${px(16)} ${px(20)} 0;`;
-            for (const row of this._artLyricRows) {
-                // (St resets the line alignment to the style's text-align on a restyle)
-                row.style = `font-size: ${px(13)}; text-align: center;`;
-            }
         }
 
         _controlPlayback(action) {
@@ -1850,9 +1816,17 @@ export default class MusicLyricsExtension extends Extension {
             this._destroyIndicator();
             this._createIndicator();
         });
+
+        // Opens or closes the dropdown; the shell rebinds it when the setting changes
+        Main.wm.addKeybinding('toggle-menu-shortcut', this._settings, Meta.KeyBindingFlags.NONE,
+            // (POPUP so the same shortcut closes it again while it holds the keyboard)
+            Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW | Shell.ActionMode.POPUP,
+            () => this._indicator?.menu.toggle());
     }
 
     disable() {
+        Main.wm.removeKeybinding('toggle-menu-shortcut');
+
         if (this._settingsSignalId) {
             this._settings.disconnect(this._settingsSignalId);
             this._settingsSignalId = null;

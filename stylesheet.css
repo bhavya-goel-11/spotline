@@ -93,8 +93,7 @@
 }
 
 .spotline-art-lyric {
-    /* Same size as the current line in the top bar, but regular and faded;
-       scaled up with a wider dropdown in extension.js */
+    /* Same size as the current line in the top bar, but regular and faded */
     font-size: 13px;
     font-weight: 500;
     color: rgba(255, 255, 255, 0.78);
