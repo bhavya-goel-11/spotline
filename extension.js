@@ -25,6 +25,10 @@ const CLOCK_GAP_PX = 8;
 const LABEL_MIN_FILL_WIDTH_PX = 200;
 // Space kept above and below the dropdown when the square would not fit on screen
 const MENU_SCREEN_MARGIN_PX = 24;
+// Dropdown width the track title, artist, playback buttons and the card's padding
+// keep their stylesheet size at (the default 344px label in its panel button); a wider dropdown scales them
+// up to match
+const CARD_BASE_WIDTH_PX = 368;
 const MPRIS_PLAYER_INTERFACE = 'org.mpris.MediaPlayer2.Player';
 
 // Lyrics API configuration
@@ -388,6 +392,8 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._artLyricsShade.height = Math.round(card.width * 0.42);
                 bottomShade.height = Math.round(card.width * 0.65);
             });
+            // From the allocation, as width reports the natural size while a layout is pending
+            card.connect('notify::allocation', () => this._scaleCardControls(card.allocation.get_width()));
 
             // Upcoming lyric at the top of the cover (the current one is in the
             // top bar); on each new line it slides up out of the cover, towards the bar
@@ -474,6 +480,35 @@ const MusicLyricsIndicator = GObject.registerClass(
             content.add_child(controlsBox);
 
             card.add_child(content);
+            this._controlsBox = controlsBox;
+            this._cardContent = content;
+        }
+
+        // Scales the track title, artist, playback buttons and the padding and spacing
+        // around them (not the upcoming lyric) with the card's width
+        _scaleCardControls(width) {
+            const scale = Math.max(1, width / CARD_BASE_WIDTH_PX);
+            const percent = Math.round(scale * 100);
+            if (percent === this._cardControlsPercent) {
+                return;
+            }
+            this._cardControlsPercent = percent;
+            const base = percent === 100;
+            const px = v => `${Math.round(v * scale)}px`;
+
+            // Title and artist inherit the box's font, so a percentage scales them from
+            // the theme's size
+            this._trackTextBox.style = base ? null : `font-size: ${percent}%;`;
+            // Spacing, padding and icon size mirror stylesheet.css and makeControlButton.
+            // The margins grow with the card and the gap above the buttons a bit more,
+            // so the larger title and buttons don't crowd each other or the edges.
+            this._cardContent.style = base ? null
+                : `padding: ${px(14)} ${px(18)} ${px(16)}; spacing: ${px(16)};`;
+            this._controlsBox.style = base ? null : `spacing: ${px(12)};`;
+            for (const button of [this._prevButton, this._playPauseButton, this._nextButton]) {
+                button.style = base ? null : `padding: ${px(8)} ${px(22)};`;
+                button.child.icon_size = Math.round(20 * scale);
+            }
         }
 
         _controlPlayback(action) {
