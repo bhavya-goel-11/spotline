@@ -3,6 +3,8 @@ import St from 'gi://St';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
+import GdkPixbuf from 'gi://GdkPixbuf';
+import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
 import Soup from 'gi://Soup';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -11,6 +13,20 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const MPRIS_PLAYER_PATH = '/org/mpris/MediaPlayer2';
+
+// Top-bar lyric: its width outside the left-half mode, its font size (matches
+// stylesheet.css) and the smallest size a long line may shrink to before it is ellipsized
+const LABEL_DEFAULT_WIDTH_PX = 344;
+const LABEL_FONT_PX = 13;
+const LABEL_MIN_FONT_PX = 11;
+// Left-half mode: room left before the clock, and a floor for odd panel layouts
+const CLOCK_GAP_PX = 8;
+const LABEL_MIN_FILL_WIDTH_PX = 200;
+// Dropdown width its stylesheet sizes are for (the default 344px label in its
+// panel button); a wider dropdown scales its text, padding and buttons up to match
+const CARD_BASE_WIDTH_PX = 368;
+// Space kept above and below the dropdown when the square would not fit on screen
+const MENU_SCREEN_MARGIN_PX = 24;
 const MPRIS_PLAYER_INTERFACE = 'org.mpris.MediaPlayer2.Player';
 
 // Lyrics API configuration
@@ -19,6 +35,128 @@ const LYRICS_SEARCH_URL = 'https://lrclib.net/api/search';
 const LYRICS_DURATION_TOLERANCE_S = 5;
 const LYRICS_CACHE_MAX_BYTES = 10 * 1024 * 1024;
 const LYRICS_CACHE_PRUNE_INTERVAL_US = 10 * 60 * GLib.USEC_PER_SEC;
+// A sung line held longer than this with no next line is treated as an
+// instrumental stretch (solos, outros) and the track title is shown instead
+const LYRIC_LINE_MAX_MS = 10000;
+// Lines that only mark music, e.g. "♪" or "(instrumental)"
+const INSTRUMENTAL_LINE_RE = /^[\s♪♫♬♩🎵🎶()[\]-]*(instrumental)?[\s♪♫♬♩🎵🎶()[\]-]*$/iu;
+
+// Transition timings
+const TEXT_FADE_OUT_MS = 120;
+const TEXT_FADE_IN_MS = 180;
+const ALBUM_ART_CROSSFADE_MS = 300;
+const ART_LYRICS_SCROLL_MS = 450;
+// Upper bound on waiting for St to drop a rewritten cover from its texture cache
+const ALBUM_ART_RELOAD_TIMEOUT_MS = 500;
+// Covers are read into the shell's memory, and players choose what artUrl points at
+const ALBUM_ART_MAX_BYTES = 20 * 1024 * 1024;
+// Browsers hand over 150px covers, which look soft stretched across the dropdown;
+// anything under this size is worth looking for a sharper copy of
+const ALBUM_ART_SHARP_SIZE = 300;
+const ALBUM_ART_SMALL_MAX_BYTES = 300 * 1024;
+const ITUNES_SEARCH_URL = 'https://itunes.apple.com/search';
+const ITUNES_ART_SIZE = '600x600bb';
+
+// Older Spotify builds report a dead open.spotify.com host for the same image
+function normalizeAlbumArtUrl(artUrl) {
+    return artUrl?.replace('https://open.spotify.com/image/', 'https://i.scdn.co/image/') || null;
+}
+
+function isSmallCover(bytes) {
+    // A file this big isn't a small image, and decoding it would stall the shell
+    if (bytes.get_size() > ALBUM_ART_SMALL_MAX_BYTES) {
+        return false;
+    }
+    try {
+        const loader = new GdkPixbuf.PixbufLoader();
+        loader.write_bytes(bytes);
+        loader.close();
+        const pixbuf = loader.get_pixbuf();
+        return Math.min(pixbuf.get_width(), pixbuf.get_height()) < ALBUM_ART_SHARP_SIZE;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Lowercased with "(feat. ...)" style suffixes and punctuation gone, so J-Star matches Jstar
+function normalizeMatchText(text) {
+    return (text ?? '').toLowerCase()
+        .replace(/[([].*?[)\]]/g, '')
+        .replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+// A wrong cover is worse than a soft one. Title and artist must match, and since a
+// remix or cover version can share those, the album or the length has to confirm it.
+function findMatchingRelease(results, track) {
+    const title = normalizeMatchText(track.title);
+    const artist = normalizeMatchText(track.artist);
+    const album = normalizeMatchText(track.album);
+    if (!title || !artist) {
+        return null;
+    }
+
+    const matches = results.filter(result => {
+        const resultArtist = normalizeMatchText(result.artistName);
+        return result.artworkUrl100 && resultArtist &&
+            normalizeMatchText(result.trackName) === title &&
+            (resultArtist.includes(artist) || artist.includes(resultArtist));
+    });
+
+    const sameAlbum = album && matches.find(result => normalizeMatchText(result.collectionName) === album);
+    if (sameAlbum) {
+        return sameAlbum;
+    }
+
+    const lengthGap = result => Math.abs(result.trackTimeMillis / 1000 - track.duration);
+    return matches
+        .filter(result => track.duration > 0 && lengthGap(result) <= LYRICS_DURATION_TOLERANCE_S)
+        .sort((a, b) => lengthGap(a) - lengthGap(b))[0] ?? null;
+}
+
+// iTunes catalogs differ by country and many songs are in only one, so start with
+// where the machine is (the timezone is a better hint than a language like en_US)
+function itunesCountries() {
+    const countries = [];
+    try {
+        const timezone = GLib.TimeZone.new_local().get_identifier();
+        const [, contents] = GLib.file_get_contents('/usr/share/zoneinfo/zone.tab');
+        const zone = new TextDecoder().decode(contents).split('\n')
+            .find(line => line.split('\t')[2] === timezone);
+        if (zone) {
+            countries.push(zone.slice(0, 2));
+        }
+    } catch (e) {
+        // Not every system has the file; the language and US below still work
+    }
+    const language = GLib.get_language_names()[0]?.match(/_([A-Z]{2})/)?.[1];
+    return [...new Set([...countries, language, 'US'].filter(Boolean))];
+}
+
+// Widget that can be made as tall as it is wide, for the album art card
+const SquareWidget = GObject.registerClass(
+    class SquareWidget extends St.Widget {
+        setSquare(square) {
+            this._square = square;
+            this.queue_relayout();
+        }
+
+        vfunc_get_preferred_height(forWidth) {
+            if (!this._square || forWidth < 0) {
+                return super.vfunc_get_preferred_height(forWidth);
+            }
+            return [forWidth, forWidth];
+        }
+    });
+
+function newVerticalBox(params) {
+    const box = new St.BoxLayout(params);
+    if ('orientation' in box) {
+        box.orientation = Clutter.Orientation.VERTICAL;
+    } else {
+        box.vertical = true;
+    }
+    return box;
+}
 
 // Helper function to check if a bus name is a supported music player
 function isSupportedPlayer(busName) {
@@ -76,7 +214,7 @@ const MusicLyricsIndicator = GObject.registerClass(
 
             this._settings = settings;
 
-            // Create a box to hold label and info icon
+            // Create a box to hold the label
             const box = new St.BoxLayout({
                 style_class: 'panel-status-menu-box'
             });
@@ -87,41 +225,15 @@ const MusicLyricsIndicator = GObject.registerClass(
                 style_class: 'spotify-lyrics-label'
             });
 
-            // Enable text clipping with ellipsis
+            // Fixed width so the indicator never shifts between lines; lines too long for
+            // it shrink (see _fitLabelFont), then ellipsize
+            this._labelWidth = LABEL_DEFAULT_WIDTH_PX;
+            this._label.set_width(this._labelWidth);
             this._label.clutter_text.ellipsize = Pango.EllipsizeMode.END;
-
-            // Info icon button
-            this._infoIcon = new St.Icon({
-                icon_name: 'dialog-information-symbolic',
-                style_class: 'system-status-icon',
-                icon_size: 16,
-                y_align: Clutter.ActorAlign.CENTER,
-                opacity: 0,
-                reactive: true
-            });
+            this._label.connect('notify::mapped', () => this._fitLabelFont());
 
             box.add_child(this._label);
-            box.add_child(this._infoIcon);
             this.add_child(box);
-
-            // Show/hide info icon on hover
-            this.connect('enter-event', () => {
-                this._infoIcon.ease({
-                    opacity: 255,
-                    duration: 200,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD
-                });
-                // Update truncation on hover just in case
-                this._updateLabelText();
-            });
-
-            this.connect('leave-event', () => {
-                this._infoIcon.ease({
-                    opacity: 0,
-                    duration: 200,
-                    mode: Clutter.AnimationMode.EASE_OUT_QUAD
-                });
-            });
 
             this._currentTrack = null;
             this._currentLyrics = null;
@@ -132,6 +244,35 @@ const MusicLyricsIndicator = GObject.registerClass(
                 'spotline',
                 'lyrics-v1'
             ]);
+            this._albumArtDir = GLib.build_filenamev([
+                GLib.get_user_cache_dir(),
+                'spotline',
+                'album-art'
+            ]);
+            this._albumArtUrl = null;
+            this._albumArtSourceUrl = null;
+            this._smallArtSourceUrl = null;
+            // Sharper cover URL per track, or null when there isn't one
+            this._sharperArtUrls = new Map();
+            this._durationPending = false;
+            this._albumArtReady = false;
+            this._showAlbumArt = this._settings.get_boolean('show-album-art');
+            this._albumArtExpanded = false;
+            this._pendingArtSwap = null;
+            this._pendingFades = new Map();
+            this._labelTarget = null;
+            this._trackInfoTarget = null;
+
+            // St caches background images for the whole session and only drops one
+            // when its file changes, so covers rotate through two fixed files
+            this._textureFileChangedId = St.TextureCache.get_default().connect(
+                'texture-file-changed',
+                (cache, file) => {
+                    if (this._pendingArtSwap?.file.equal(file)) {
+                        this._finishArtSwap();
+                    }
+                }
+            );
             this._proxy = null;
             this._propertiesChangedId = null;
             this._lyricsTimeoutId = null;
@@ -146,59 +287,172 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._soupSession = new Soup.Session();
             this._soupSession.user_agent = 'Spotline GNOME Extension/1.0';
 
-            // Internal state for lyrics - using GSettings for preferences now
-            this._showLyrics = true;
+            this._showLyrics = this._settings.get_boolean('show-lyrics');
             this._isDestroyed = false;
-            this._maxLength = this._settings.get_int('max-text-length');
             this._lyricsOffset = this._settings.get_int('lyrics-offset');
 
             // Connect setting signals
-            this._settingsSignalId = this._settings.connect('changed::max-text-length', () => {
-                this._maxLength = this._settings.get_int('max-text-length');
-                this._updateLabelText();
-            });
-
             this._offsetSignalId = this._settings.connect('changed::lyrics-offset', () => {
                 this._lyricsOffset = this._settings.get_int('lyrics-offset');
             });
 
+            // Toggles and actions that live in the extension's preferences
+            this._prefsSignalIds = [
+                this._settings.connect('changed::show-lyrics', () => {
+                    this._showLyrics = this._settings.get_boolean('show-lyrics');
+                    if (!this._showLyrics) {
+                        this._clearLyrics();
+                    }
+                    this._updateTrackInfo(true);
+                }),
+                this._settings.connect('changed::show-album-art', () => {
+                    this._showAlbumArt = this._settings.get_boolean('show-album-art');
+                    this._syncAlbumArt();
+                }),
+                this._settings.connect('changed::sharper-album-art', () => {
+                    this._updateTrackInfo();
+                }),
+                this._settings.connect('changed::refresh-player-request', () => {
+                    this._findActivePlayer();
+                })
+            ];
+
             this.menu.box.add_style_class_name('spotline-menu');
+            // Pin the dropdown to the indicator's width so it spans the whole
+            // top-bar pill and never resizes with the track name
+            this.connect('notify::width', () => this._syncMenuWidth());
             this._buildMenu();
             this._initLyricsCacheDirectory();
             this._setupDBusMonitoring();
         }
 
         _buildMenu() {
-            // Player info section
-            this._playerInfoItem = new PopupMenu.PopupMenuItem('No player connected', {
-                reactive: false
+            // The whole dropdown is one card. With album art the cover fills all of
+            // it, edge to edge, and everything else sits on top; without, it is a
+            // plain compact layout.
+            const cardItem = new PopupMenu.PopupBaseMenuItem({
+                reactive: false,
+                can_focus: false,
+                style_class: 'spotline-card-item'
             });
-            this._playerInfoItem.label.style = 'font-size: 0.85em; color: #888;';
-            this.menu.addMenuItem(this._playerInfoItem);
-
-            // Track info section
-            this._trackInfoItem = new PopupMenu.PopupMenuItem('No track playing', {
-                reactive: false
-            });
-            // Wrap long names inside the fixed-width menu instead of widening it
-            this._trackInfoItem.label.x_expand = true;
-            this._trackInfoItem.label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
-            this._trackInfoItem.label.clutter_text.line_wrap = true;
-            this._trackInfoItem.label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
-            this.menu.addMenuItem(this._trackInfoItem);
-
-            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-            // Playback controls
-            const controlsBox = new St.BoxLayout({
+            // (HIDDEN is missing on older shells, where the item has no ornament slot)
+            if (PopupMenu.Ornament.HIDDEN !== undefined) {
+                cardItem.setOrnament(PopupMenu.Ornament.HIDDEN);
+            }
+            const card = this._card = new SquareWidget({
+                style_class: 'spotline-card',
+                layout_manager: new Clutter.BinLayout(),
                 x_expand: true,
-                x_align: Clutter.ActorAlign.CENTER,
-                style: 'spacing: 12px;'
+                clip_to_allocation: true
+            });
+            cardItem.add_child(card);
+            this.menu.addMenuItem(cardItem);
+
+            // Cover, in two slots so a new one can fade in over the old one, and
+            // shades that keep the text on top of it readable
+            this._coverLayer = new St.Widget({
+                layout_manager: new Clutter.BinLayout(),
+                x_expand: true,
+                y_expand: true,
+                visible: false
+            });
+            this._albumArtSlots = [0, 1].map(i => {
+                const widget = new St.Widget({
+                    style_class: 'spotline-album-art',
+                    x_expand: true,
+                    y_expand: true,
+                    opacity: 0
+                });
+                this._coverLayer.add_child(widget);
+                return {
+                    widget,
+                    file: Gio.File.new_for_path(GLib.build_filenamev([this._albumArtDir, `cover-${i}.jpg`]))
+                };
+            });
+            this._albumArtFront = 0;
+            this._artLyricsShade = new St.Widget({
+                style_class: 'spotline-art-lyrics-shade',
+                x_expand: true,
+                y_expand: true,
+                y_align: Clutter.ActorAlign.START,
+                visible: false
+            });
+            const bottomShade = new St.Widget({
+                style_class: 'spotline-cover-bottom-shade',
+                x_expand: true,
+                y_expand: true,
+                y_align: Clutter.ActorAlign.END
+            });
+            this._coverLayer.add_child(this._artLyricsShade);
+            this._coverLayer.add_child(bottomShade);
+            card.add_child(this._coverLayer);
+            card.connect('notify::width', () => {
+                this._artLyricsShade.height = Math.round(card.width * 0.42);
+                bottomShade.height = Math.round(card.width * 0.65);
+            });
+            // From the allocation, as width reports the natural size while a layout is pending
+            card.connect('notify::allocation', () => this._scaleCardContent(card.allocation.get_width()));
+
+            // Upcoming lyric at the top of the cover (the current one is in the
+            // top bar); on each new line it slides up out of the cover, towards the bar
+            this._artLyricsBox = new St.Widget({
+                style_class: 'spotline-art-lyrics',
+                layout_manager: new Clutter.BinLayout(),
+                x_expand: true,
+                y_expand: true,
+                clip_to_allocation: true,
+                visible: false
+            });
+            // Two overlapping rows so the outgoing line can leave as the new one arrives
+            this._artLyricRows = [0, 1].map(() => {
+                const label = new St.Label({
+                    style_class: 'spotline-art-lyric',
+                    x_expand: true,
+                    y_expand: true,
+                    x_align: Clutter.ActorAlign.CENTER,
+                    y_align: Clutter.ActorAlign.START
+                });
+                label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+                label.clutter_text.line_wrap = true;
+                label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+                label.clutter_text.line_alignment = Pango.Alignment.CENTER;
+                this._artLyricsBox.add_child(label);
+                return label;
+            });
+            this._artLyricFront = 0;
+            this._artLyricsActive = false;
+            card.add_child(this._artLyricsBox);
+
+            // Track info and playback controls, along the bottom of the card
+            const content = newVerticalBox({
+                style_class: 'spotline-card-content',
+                x_expand: true,
+                y_expand: true,
+                y_align: Clutter.ActorAlign.END
+            });
+
+            const trackTextBox = this._trackTextBox = newVerticalBox({x_expand: true});
+            this._trackTitleLabel = new St.Label({style_class: 'spotline-track-title'});
+            this._trackArtistLabel = new St.Label({style_class: 'spotline-track-artist'});
+            for (const label of [this._trackTitleLabel, this._trackArtistLabel]) {
+                // Wrap long names inside the fixed-width menu instead of widening it
+                label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+                label.clutter_text.line_wrap = true;
+                label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+                trackTextBox.add_child(label);
+            }
+            content.add_child(trackTextBox);
+            this._setTrackInfo('No track playing');
+
+            const controlsBox = new St.BoxLayout({
+                style_class: 'spotline-controls',
+                x_expand: true,
+                x_align: Clutter.ActorAlign.CENTER
             });
 
             const makeControlButton = (iconName, action) => {
                 const button = new St.Button({
-                    style_class: 'button',
+                    style_class: 'spotline-control',
                     reactive: true,
                     can_focus: true,
                     track_hover: true,
@@ -221,67 +475,39 @@ const MusicLyricsIndicator = GObject.registerClass(
             controlsBox.add_child(prevButton);
             controlsBox.add_child(playPauseButton);
             controlsBox.add_child(nextButton);
+            content.add_child(controlsBox);
 
-            const controlsItem = new PopupMenu.PopupBaseMenuItem({
-                reactive: false,
-                can_focus: false
-            });
-            controlsItem.add_child(controlsBox);
-            this.menu.addMenuItem(controlsItem);
+            card.add_child(content);
+            this._cardContent = content;
+            this._controlsBox = controlsBox;
+            this._cardScale = 1;
+        }
 
-            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        // Scales what sits on the card with its width, from the stylesheet's sizes
+        // (mirrored here) at CARD_BASE_WIDTH_PX
+        _scaleCardContent(width) {
+            const scale = Math.max(1, width / CARD_BASE_WIDTH_PX);
+            if (Math.abs(scale - this._cardScale) < 0.01) {
+                return;
+            }
+            this._cardScale = scale;
+            const px = v => `${Math.round(v * scale)}px`;
 
-            // Toggle lyrics display
-            this._lyricsToggle = new PopupMenu.PopupSwitchMenuItem(
-                'Show Lyrics',
-                this._showLyrics
-            );
-            this._lyricsToggle.connect('toggled', (item) => {
-                this._showLyrics = item.state;
-                if (!item.state) {
-                    if (this._lyricsTimeoutId) {
-                        GLib.source_remove(this._lyricsTimeoutId);
-                        this._lyricsTimeoutId = null;
-                    }
-                    this._updateTrackInfo(true);
-                } else {
-                    this._updateTrackInfo(true);
-                }
-            });
-            this.menu.addMenuItem(this._lyricsToggle);
-
-            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-            // Refresh button
-            const refreshItem = new PopupMenu.PopupMenuItem('Refresh Player');
-            refreshItem.connect('activate', () => {
-                this._findActivePlayer();
-            });
-            this.menu.addMenuItem(refreshItem);
-
-            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-            // Info submenu
-            this._infoSubmenu = new PopupMenu.PopupSubMenuMenuItem('About');
-
-            // GitHub link
-            const githubItem = new PopupMenu.PopupMenuItem('View on GitHub');
-            githubItem.connect('activate', () => {
-                Gio.AppInfo.launch_default_for_uri(
-                    'https://github.com/d3osaju/Spotline',
-                    null
-                );
-            });
-            this._infoSubmenu.menu.addMenuItem(githubItem);
-
-            // Credits
-            const creditsItem = new PopupMenu.PopupMenuItem('Created by deosaju', {
-                reactive: false
-            });
-            creditsItem.label.style = 'font-size: 0.9em; color: #888;';
-            this._infoSubmenu.menu.addMenuItem(creditsItem);
-
-            this.menu.addMenuItem(this._infoSubmenu);
+            // The track title and artist inherit the content's font, so a percentage
+            // scales them from whatever the theme gives the menu
+            this._cardContent.style =
+                `font-size: ${Math.round(scale * 100)}%; padding: ${px(14)} ${px(18)} ${px(16)}; spacing: ${px(12)};`;
+            this._trackArtistLabel.style = `padding-top: ${px(2)};`;
+            this._controlsBox.style = `spacing: ${px(12)};`;
+            for (const button of [this._prevButton, this._playPauseButton, this._nextButton]) {
+                button.style = `padding: ${px(8)} ${px(22)};`;
+                button.child.icon_size = Math.round(20 * scale);
+            }
+            this._artLyricsBox.style = `padding: ${px(16)} ${px(20)} 0;`;
+            for (const row of this._artLyricRows) {
+                // (St resets the line alignment to the style's text-align on a restyle)
+                row.style = `font-size: ${px(13)}; text-align: center;`;
+            }
         }
 
         _controlPlayback(action) {
@@ -482,9 +708,10 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._currentTrack = null;
             this._currentLyrics = null;
             this._currentLine = '';
+            this._setArtLyrics(null);
 
-            this._updatePlayerInfo();
-            this._trackInfoItem.label.text = 'No track playing';
+            this._setTrackInfo('No track playing');
+            this._updateAlbumArt(null);
             this._updatePlayPauseButton();
         }
 
@@ -512,7 +739,6 @@ const MusicLyricsIndicator = GObject.registerClass(
                     this._onPropertiesChanged.bind(this)
                 );
 
-                this._updatePlayerInfo();
                 this._updatePlayPauseButton();
                 this._updateTrackInfo();
                 return true;
@@ -520,41 +746,6 @@ const MusicLyricsIndicator = GObject.registerClass(
                 logError(e, `Failed to connect to ${busName}`);
                 return false;
             }
-        }
-
-        _updatePlayerInfo() {
-            if (!this._currentBusName) {
-                this._playerInfoItem.label.text = 'No player connected';
-                return;
-            }
-
-            let playerName = 'Unknown Player';
-            let playerIcon = '♪';
-
-            if (this._currentBusName.includes('spotify')) {
-                playerName = 'Spotify';
-                playerIcon = '🎵';
-            } else if (this._currentBusName.includes('youtube-music')) {
-                playerName = 'YouTube Music';
-                playerIcon = '🎵';
-            } else if (this._currentBusName.includes('chromium')) {
-                playerName = 'Chromium';
-                playerIcon = '🌐';
-            } else if (this._currentBusName.includes('chrome')) {
-                playerName = 'Chrome';
-                playerIcon = '🌐';
-            } else if (this._currentBusName.includes('firefox')) {
-                playerName = 'Firefox';
-                playerIcon = '🌐';
-            } else if (this._currentBusName.includes('brave')) {
-                playerName = 'Brave';
-                playerIcon = '🌐';
-            } else if (this._currentBusName.includes('edge')) {
-                playerName = 'Edge';
-                playerIcon = '🌐';
-            }
-
-            this._playerInfoItem.label.text = `${playerIcon} Playing from ${playerName}`;
         }
 
         _onPropertiesChanged(proxy, changed) {
@@ -576,7 +767,8 @@ const MusicLyricsIndicator = GObject.registerClass(
                 const metadata = this._playerProxy.get_cached_property('Metadata');
                 if (!metadata) {
                     this._updateLabelText('No music playing');
-                    this._trackInfoItem.label.text = 'No track playing';
+                    this._setTrackInfo('No track playing');
+                    this._updateAlbumArt(null);
                     return;
                 }
 
@@ -604,24 +796,42 @@ const MusicLyricsIndicator = GObject.registerClass(
                 }
 
                 let duration = 0;
+                // Browsers report the largest int64 until they know a new track's length
+                let durationPending = false;
                 const durationVariant = metadataDict['mpris:length'];
                 if (durationVariant) {
                     const unpackedDuration = durationVariant.deep_unpack();
-                    duration = Math.round(unpackedDuration / 1000000); // Convert microseconds to seconds
+                    durationPending = unpackedDuration >= Number.MAX_SAFE_INTEGER;
+                    if (!durationPending) {
+                        duration = Math.round(unpackedDuration / 1000000); // Convert microseconds to seconds
+                    }
                 }
 
-                // If both title and artist are missing, show icon or nothing
+                const artUrl = normalizeAlbumArtUrl(metadataDict['mpris:artUrl']?.deep_unpack());
+
+                // If both title and artist are missing, show icon or nothing. Browsers
+                // send a track change as a burst of updates starting with just the new
+                // cover, so this has to pass that on rather than dropping the art.
                 if (title === 'Unknown Track' && artist === 'Unknown Artist') {
                     this._updateLabelText('♪');
-                    this._trackInfoItem.label.text = 'Unknown track';
+                    this._setTrackInfo('Unknown track');
+                    this._albumArtSourceUrl = artUrl;
+                    this._updateAlbumArt(artUrl);
                     return;
                 }
+
+                this._albumArtSourceUrl = artUrl;
+                const sharperArtUrl = artUrl && this._settings.get_boolean('sharper-album-art')
+                    ? this._sharperArtUrls.get(this._getLyricsCacheKey(title, artist))
+                    : null;
+                this._updateAlbumArt(sharperArtUrl || artUrl);
 
                 // Check if lyrics query inputs changed to avoid redundant API calls
                 const lyricsQueryChanged = forceFetch ||
                                            !this._currentTrack ||
                                            this._currentTrack.title !== title ||
-                                           this._currentTrack.artist !== artist;
+                                           this._currentTrack.artist !== artist ||
+                                           this._lyricsLookupDeferred;
 
                 this._currentTrack = {
                     title: title,
@@ -630,16 +840,23 @@ const MusicLyricsIndicator = GObject.registerClass(
                     duration: duration
                 };
 
+                this._durationPending = durationPending;
+                this._maybeFindSharperArt();
+
                 // Update menu with track info
-                this._trackInfoItem.label.text = `${this._currentTrack.artist} - ${this._currentTrack.title}`;
+                this._setTrackInfo(this._currentTrack.title, this._currentTrack.artist);
 
                 // Only fetch lyrics if the query inputs changed or it's forced
                 if (lyricsQueryChanged) {
                     // Update label immediately with song info
                     this._updateLabelText(`${this._currentTrack.artist} - ${this._currentTrack.title}`);
 
-                    // Try to fetch lyrics if enabled
-                    if (this._showLyrics) {
+                    // Try to fetch lyrics if enabled, waiting for the real length as
+                    // the lookup would match nothing with the placeholder
+                    this._lyricsLookupDeferred = this._showLyrics && durationPending;
+                    if (this._lyricsLookupDeferred) {
+                        this._clearLyrics();
+                    } else if (this._showLyrics) {
                         this._fetchLyrics(this._currentTrack.title, this._currentTrack.artist, this._currentTrack.album, this._currentTrack.duration);
                     }
                 } else if (!this._showLyrics) {
@@ -651,7 +868,342 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
         }
 
-        _fetchLyrics(title, artist, album, duration) {
+        _setTrackInfo(title, artist = null) {
+            const target = `${title}\n${artist ?? ''}`;
+            if (target === this._trackInfoTarget) {
+                return;
+            }
+            this._trackInfoTarget = target;
+
+            this._crossfade(this._trackTextBox, () => {
+                this._trackTitleLabel.text = title;
+                this._trackArtistLabel.text = artist ?? '';
+                this._trackArtistLabel.visible = !!artist;
+            });
+        }
+
+        // Fades the actor out, applies the change and fades it back in. A change that
+        // arrives mid-fade replaces the pending one, so rapid skips settle on the last.
+        _crossfade(actor, apply) {
+            actor.remove_all_transitions();
+
+            if (!actor.mapped) {
+                this._pendingFades.delete(actor);
+                actor.opacity = 255;
+                apply();
+                return;
+            }
+
+            this._pendingFades.set(actor, apply);
+            actor.ease({
+                opacity: 0,
+                duration: TEXT_FADE_OUT_MS,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onComplete: () => {
+                    this._pendingFades.get(actor)?.();
+                    this._pendingFades.delete(actor);
+                    actor.ease({
+                        opacity: 255,
+                        duration: TEXT_FADE_IN_MS,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD
+                    });
+                }
+            });
+        }
+
+        _updateAlbumArt(url) {
+            if (url === this._albumArtUrl) {
+                return;
+            }
+            this._albumArtUrl = url;
+
+            if (!url) {
+                this._cancelArtSwap();
+                this._albumArtReady = false;
+                this._syncAlbumArt();
+                return;
+            }
+
+            // Browsers and local players hand over a file, Spotify a web URL and
+            // some players (mpv) embed the image in a data URI
+            this._loadAlbumArtBytes(url).then(bytes => {
+                if (this._isDestroyed || url !== this._albumArtUrl) {
+                    return;
+                }
+                if (!bytes?.get_size()) {
+                    throw new Error('Album art is empty');
+                }
+                this._queueArtSwap(bytes);
+
+                if (url === this._albumArtSourceUrl && isSmallCover(bytes)) {
+                    this._smallArtSourceUrl = url;
+                    this._maybeFindSharperArt();
+                }
+            }).catch(e => {
+                if (this._isDestroyed || url !== this._albumArtUrl) {
+                    return;
+                }
+                logError(e, 'Failed to load album art');
+
+                // A sharper copy that won't load is no reason to lose the player's own
+                if (this._albumArtSourceUrl && url !== this._albumArtSourceUrl && this._currentTrack) {
+                    const {title, artist} = this._currentTrack;
+                    this._sharperArtUrls.set(this._getLyricsCacheKey(title, artist), null);
+                    this._updateAlbumArt(this._albumArtSourceUrl);
+                    return;
+                }
+
+                // Better no cover than the previous song's
+                this._cancelArtSwap();
+                this._albumArtReady = false;
+                this._syncAlbumArt();
+            });
+        }
+
+        // Runs from both the metadata and the cover loading, as a browser's track
+        // change only has the small cover and the track's details after a moment
+        _maybeFindSharperArt() {
+            const track = this._currentTrack;
+            if (!track || this._durationPending || !this._albumArtSourceUrl ||
+                this._smallArtSourceUrl !== this._albumArtSourceUrl ||
+                !this._settings.get_boolean('sharper-album-art')) {
+                return;
+            }
+
+            const key = this._getLyricsCacheKey(track.title, track.artist);
+            if (this._sharperArtUrls.has(key)) {
+                return;
+            }
+            this._sharperArtUrls.set(key, null);
+
+            const isStillCurrent = () => !this._isDestroyed && this._currentTrack &&
+                this._getLyricsCacheKey(this._currentTrack.title, this._currentTrack.artist) === key;
+
+            this._lookupSharperArt(track).then(url => {
+                if (this._isDestroyed || !url) {
+                    return;
+                }
+                this._sharperArtUrls.set(key, url);
+                if (isStillCurrent() && this._albumArtSourceUrl &&
+                    this._settings.get_boolean('sharper-album-art')) {
+                    this._updateAlbumArt(url);
+                }
+            }).catch(e => {
+                if (this._isDestroyed) {
+                    return;
+                }
+                // Probably offline: let the next play of this track try again
+                this._sharperArtUrls.delete(key);
+                logError(e, 'Failed to look up sharper album art');
+            });
+        }
+
+        async _lookupSharperArt(track) {
+            this._itunesCountries ??= itunesCountries();
+            for (const country of this._itunesCountries) {
+                // eslint-disable-next-line no-await-in-loop
+                const data = await this._requestJson(ITUNES_SEARCH_URL, {
+                    term: `${track.artist} ${track.title}`,
+                    entity: 'song',
+                    limit: 25,
+                    country
+                });
+                const release = findMatchingRelease(data?.results ?? [], track);
+                if (release) {
+                    return release.artworkUrl100.replace(/\/\d+x\d+bb/, `/${ITUNES_ART_SIZE}`);
+                }
+            }
+            return null;
+        }
+
+        async _loadAlbumArtBytes(url) {
+            if (url.startsWith('file://')) {
+                return this._readAlbumArtFile(url);
+            }
+            if (url.startsWith('http://') || url.startsWith('https://')) {
+                return this._downloadAlbumArt(url);
+            }
+            if (url.startsWith('data:')) {
+                return Soup.uri_decode_data_uri(url)[0];
+            }
+            throw new Error(`Unsupported album art URL: ${url.slice(0, 40)}`);
+        }
+
+        _readAlbumArtFile(url) {
+            const file = Gio.File.new_for_uri(url);
+            return new Promise((resolve, reject) => {
+                file.query_info_async('standard::type,standard::size', Gio.FileQueryInfoFlags.NONE,
+                    GLib.PRIORITY_DEFAULT, null, (source, infoResult) => {
+                        try {
+                            // Regular files only: reading a device could never finish
+                            const info = source.query_info_finish(infoResult);
+                            if (info.get_file_type() !== Gio.FileType.REGULAR ||
+                                info.get_size() > ALBUM_ART_MAX_BYTES) {
+                                throw new Error('Album art file is not a usable size or type');
+                            }
+                        } catch (e) {
+                            reject(e);
+                            return;
+                        }
+                        source.load_bytes_async(null, (loaded, loadResult) => {
+                            try {
+                                resolve(loaded.load_bytes_finish(loadResult)[0]);
+                            } catch (e) {
+                                reject(e);
+                            }
+                        });
+                    });
+            });
+        }
+
+        _downloadAlbumArt(url) {
+            const msg = Soup.Message.new('GET', url);
+            const cancellable = new Gio.Cancellable();
+            msg.connect('got-headers', () => {
+                if (msg.get_response_headers().get_content_length() > ALBUM_ART_MAX_BYTES) {
+                    cancellable.cancel();
+                }
+            });
+            return new Promise((resolve, reject) => {
+                this._soupSession.send_and_read_async(msg, GLib.PRIORITY_DEFAULT, cancellable, (session, result) => {
+                    try {
+                        const bytes = session.send_and_read_finish(result);
+                        if (msg.get_status() !== Soup.Status.OK) {
+                            throw new Error(`Album art request returned ${msg.get_status()}`);
+                        }
+                        resolve(bytes);
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+            });
+        }
+
+        // Writes the cover into the hidden slot's file, then waits for St to reload it
+        _queueArtSwap(bytes) {
+            this._cancelArtSwap();
+
+            const back = this._albumArtSlots[1 - this._albumArtFront];
+            try {
+                // Written in place (not via a temp file and rename) so St's file
+                // monitor sees the change and evicts the old texture
+                GLib.file_set_contents_full(back.file.get_path(), bytes.get_data(),
+                    GLib.FileSetContentsFlags.NONE, 0o600);
+            } catch (e) {
+                logError(e, 'Failed to save album art');
+                return;
+            }
+            back.widget.style = `background-image: url("${back.file.get_uri()}");`;
+
+            // A file St never loaded has no monitor, so the signal may never come
+            this._pendingArtSwap = {
+                file: back.file,
+                timeoutId: GLib.timeout_add(GLib.PRIORITY_DEFAULT, ALBUM_ART_RELOAD_TIMEOUT_MS, () => {
+                    this._pendingArtSwap.timeoutId = 0;
+                    this._finishArtSwap();
+                    return GLib.SOURCE_REMOVE;
+                })
+            };
+        }
+
+        _finishArtSwap() {
+            this._cancelArtSwap();
+
+            const front = this._albumArtSlots[this._albumArtFront];
+            this._albumArtFront = 1 - this._albumArtFront;
+            const back = this._albumArtSlots[this._albumArtFront];
+
+            front.widget.remove_all_transitions();
+            back.widget.remove_all_transitions();
+            // Above the old cover but still under the lyrics overlay
+            back.widget.get_parent().set_child_below_sibling(back.widget, this._artLyricsShade);
+
+            if (this._albumArtExpanded && this.menu.isOpen) {
+                // Fade the new cover in over the old one, which stays opaque underneath
+                back.widget.opacity = 0;
+                back.widget.ease({
+                    opacity: 255,
+                    duration: ALBUM_ART_CROSSFADE_MS,
+                    mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+                    onComplete: () => {
+                        front.widget.opacity = 0;
+                    }
+                });
+            } else {
+                back.widget.opacity = 255;
+                front.widget.opacity = 0;
+            }
+
+            this._albumArtReady = true;
+            this._syncAlbumArt();
+        }
+
+        _cancelArtSwap() {
+            if (this._pendingArtSwap?.timeoutId) {
+                GLib.source_remove(this._pendingArtSwap.timeoutId);
+            }
+            this._pendingArtSwap = null;
+        }
+
+        _syncAlbumArt() {
+            this._setAlbumArtExpanded(this._albumArtReady && this._showAlbumArt);
+        }
+
+        // Grows the card into the square cover (or back to the compact layout)
+        // while the menu is open, otherwise snaps
+        _setAlbumArtExpanded(expanded) {
+            if (expanded === this._albumArtExpanded) {
+                return;
+            }
+            this._albumArtExpanded = expanded;
+
+            const card = this._card;
+            const cover = this._coverLayer;
+            card.remove_all_transitions();
+            cover.remove_all_transitions();
+            this._syncArtLyricsVisible();
+
+            if (!this.menu.isOpen) {
+                card.setSquare(expanded);
+                card.set_height(-1);
+                cover.opacity = 255;
+                cover.visible = expanded;
+                return;
+            }
+
+            // From the allocation, as width and height report natural sizes while a
+            // layout is pending, such as just after the track's title has changed
+            const startHeight = card.allocation.get_height();
+            card.setSquare(expanded);
+            const [, endHeight] = card.get_preferred_height(card.allocation.get_width());
+            card.height = startHeight;
+
+            const params = {
+                duration: 250,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD
+            };
+            card.ease({...params, height: endHeight, onComplete: () => card.set_height(-1)});
+            if (expanded) {
+                cover.opacity = 0;
+                cover.show();
+            }
+            cover.ease({
+                ...params,
+                opacity: expanded ? 255 : 0,
+                onComplete: () => {
+                    cover.visible = this._albumArtExpanded;
+                    cover.opacity = 255;
+                }
+            });
+        }
+
+        // The upcoming lyric only shows on top of the cover
+        _syncArtLyricsVisible() {
+            this._artLyricsBox.visible = this._artLyricsShade.visible =
+                this._artLyricsActive && this._albumArtExpanded;
+        }
+
+        _clearLyrics() {
             // Clear any existing lyrics timeout
             if (this._lyricsTimeoutId) {
                 GLib.source_remove(this._lyricsTimeoutId);
@@ -661,6 +1213,11 @@ const MusicLyricsIndicator = GObject.registerClass(
             // Clear previous lyrics state
             this._currentLyrics = null;
             this._currentLine = '';
+            this._setArtLyrics(null);
+        }
+
+        _fetchLyrics(title, artist, album, duration) {
+            this._clearLyrics();
 
             const cacheKey = this._getLyricsCacheKey(title, artist);
             const cachedLyrics = this._lyricsCache.get(cacheKey);
@@ -786,6 +1343,7 @@ const MusicLyricsIndicator = GObject.registerClass(
         _initLyricsCacheDirectory() {
             try {
                 GLib.mkdir_with_parents(this._lyricsCacheDir, 0o700);
+                GLib.mkdir_with_parents(this._albumArtDir, 0o700);
             } catch (e) {
                 logError(e, 'Failed to initialize lyrics cache');
             }
@@ -991,6 +1549,11 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
         }
 
+        _trackLabelText() {
+            const track = this._currentTrack;
+            return track ? `${track.artist} - ${track.title}` : null;
+        }
+
         _parseLRC(lrcText) {
             // Parse LRC format: [mm:ss.xx]lyrics
             const lines = [];
@@ -1006,9 +1569,9 @@ const MusicLyricsIndicator = GObject.registerClass(
 
                     const timeMs = (minutes * 60 + seconds) * 1000 + centiseconds * 10;
 
-                    if (text) {
-                        lines.push({ time: timeMs, text: text });
-                    }
+                    // Empty and "♪" lines mark instrumental stretches; keep them
+                    // as empty gaps so the title shows there
+                    lines.push({ time: timeMs, text: INSTRUMENTAL_LINE_RE.test(text) ? '' : text });
                 }
             }
 
@@ -1055,15 +1618,30 @@ const MusicLyricsIndicator = GObject.registerClass(
                             // Convert microseconds to milliseconds and add user offset
                             const positionMs = (positionUs / 1000) + this._lyricsOffset;
 
-                            // Find the current lyric line
-                            let currentLine = this._currentLyrics[0].text;
-
-                            for (let i = this._currentLyrics.length - 1; i >= 0; i--) {
-                                if (this._currentLyrics[i].time <= positionMs) {
-                                    currentLine = this._currentLyrics[i].text;
-                                    break;
-                                }
+                            // Find the current lyric line; the intro, gaps and an outro
+                            // with no singing show the track title instead
+                            const lines = this._currentLyrics;
+                            let index = lines.length - 1;
+                            while (index >= 0 && lines[index].time > positionMs) {
+                                index--;
                             }
+
+                            let sungLine = '';
+                            if (index >= 0) {
+                                const nextTime = index + 1 < lines.length ? lines[index + 1].time : Infinity;
+                                const heldTooLong = nextTime - lines[index].time > LYRIC_LINE_MAX_MS &&
+                                    positionMs - lines[index].time > LYRIC_LINE_MAX_MS;
+                                sungLine = heldTooLong ? '' : lines[index].text;
+                            }
+
+                            let nextLine = '';
+                            for (let i = index + 1; i < lines.length && !nextLine; i++) {
+                                nextLine = lines[i].text;
+                            }
+                            this._setArtLyrics(sungLine || '♪', nextLine);
+
+                            const currentLine = sungLine ||
+                                (this._trackLabelText() ?? lines.find(line => line.text)?.text ?? '');
 
                             if (currentLine !== this._currentLine) {
                                 this._currentLine = currentLine;
@@ -1079,34 +1657,147 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
         }
 
+        // Shows the upcoming lyric over the album art (null hides it). When it
+        // becomes the current line it slides up and away as the next one comes in.
+        _setArtLyrics(current, next = '') {
+            const box = this._artLyricsBox;
+            const front = this._artLyricRows[this._artLyricFront];
+
+            if (current === null) {
+                this._artLyricsActive = false;
+                this._syncArtLyricsVisible();
+                this._finishArtLyricsScroll();
+                for (const row of this._artLyricRows) {
+                    row.text = '';
+                }
+                return;
+            }
+            this._artLyricsActive = true;
+            this._syncArtLyricsVisible();
+
+            if (next === front.text) {
+                return;
+            }
+
+            // A plain change (seek, gap) crossfades; only an advance scrolls
+            // (not mid-crossfade, whose pending update would overwrite the scroll)
+            const scroll = box.mapped && !this._pendingFades.has(box) &&
+                front.text !== '' && current === front.text;
+            if (!scroll) {
+                this._crossfade(box, () => {
+                    this._finishArtLyricsScroll();
+                    this._artLyricRows[this._artLyricFront].text = next;
+                });
+                return;
+            }
+
+            this._finishArtLyricsScroll();
+            const outgoing = this._artLyricRows[this._artLyricFront];
+            this._artLyricFront = 1 - this._artLyricFront;
+            const incoming = this._artLyricRows[this._artLyricFront];
+            incoming.text = next;
+
+            const params = {
+                duration: ART_LYRICS_SCROLL_MS,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC
+            };
+            const shift = outgoing.height;
+            outgoing.ease({...params, translation_y: -shift, opacity: 0});
+            incoming.translation_y = shift;
+            incoming.opacity = 0;
+            incoming.ease({...params, translation_y: 0, opacity: 255});
+        }
+
+        // Jumps an in-progress scroll to its end
+        _finishArtLyricsScroll() {
+            this._artLyricRows.forEach((row, i) => {
+                row.remove_all_transitions();
+                row.translation_y = 0;
+                row.opacity = i === this._artLyricFront ? 255 : 0;
+            });
+        }
+
         _updateLabelText(text = null) {
             if (text !== null) {
                 this._currentText = text;
             }
 
             const display = this._currentText || 'No music playing';
-            this._label.set_text(this._truncateText(display, this._maxLength));
+            if (display === this._labelTarget) {
+                return;
+            }
+            this._labelTarget = display;
+            this._crossfade(this._label, () => {
+                this._label.set_text(display);
+                this._fitLabelFont();
+            });
         }
 
-        _truncateText(text, maxLength) {
-            if (text.length <= maxLength) {
-                return text;
+        get labelWidth() {
+            return this._labelWidth;
+        }
+
+        // Width of the top-bar lyric, padding included
+        setLabelWidth(width) {
+            width = Math.round(width);
+            if (width === this._labelWidth) {
+                return;
             }
-            return text.substring(0, maxLength - 3) + '...';
+            this._labelWidth = width;
+            this._label.set_width(width);
+            this._fitLabelFont();
+        }
+
+        // Shrinks the font of a line too long for the label, down to a floor, so as
+        // much of it as possible shows; whatever still doesn't fit is ellipsized
+        _fitLabelFont() {
+            const label = this._label;
+            if (!label.mapped) {
+                return;
+            }
+            label.style = null;
+            label.ensure_style();
+            const avail = this._labelWidth - label.get_theme_node().get_horizontal_padding();
+            // The text's natural width is its full, unellipsized width
+            const textWidth = () => label.clutter_text.get_preferred_width(-1)[1];
+
+            const width = textWidth();
+            if (width <= avail) {
+                return;
+            }
+            // Text width scales about linearly with the font size; hinting can leave it
+            // a hair over, so step down a little more until it fits
+            let size = Math.floor(LABEL_FONT_PX * avail / width * 2) / 2;
+            for (let i = 0; i < 4; i++) {
+                size = Math.max(LABEL_MIN_FONT_PX, size);
+                label.style = `font-size: ${size}px;`;
+                label.ensure_style();
+                if (size === LABEL_MIN_FONT_PX || textWidth() <= avail) {
+                    break;
+                }
+                size -= 0.5;
+            }
+        }
+
+        // The dropdown matches the pill, but its square cover must still fit on screen
+        _syncMenuWidth() {
+            const workArea = Main.layoutManager.getWorkAreaForMonitor(Main.layoutManager.primaryIndex);
+            const maxWidth = workArea ? workArea.height - 2 * MENU_SCREEN_MARGIN_PX : Infinity;
+            this.menu.actor.width = Math.min(this.width, maxWidth);
         }
 
         destroy() {
             this._isDestroyed = true;
 
-            if (this._settingsSignalId) {
-                this._settings.disconnect(this._settingsSignalId);
-                this._settingsSignalId = null;
-            }
-
             if (this._offsetSignalId) {
                 this._settings.disconnect(this._offsetSignalId);
                 this._offsetSignalId = null;
             }
+
+            for (const id of this._prefsSignalIds) {
+                this._settings.disconnect(id);
+            }
+            this._prefsSignalIds = [];
 
             if (this._lyricsTimeoutId) {
                 GLib.source_remove(this._lyricsTimeoutId);
@@ -1132,6 +1823,8 @@ const MusicLyricsIndicator = GObject.registerClass(
             }
 
             this._soupSession.abort();
+            this._cancelArtSwap();
+            St.TextureCache.get_default().disconnect(this._textureFileChangedId);
 
             this._dbusProxy = null;
             this._proxy = null;
@@ -1182,33 +1875,52 @@ export default class MusicLyricsExtension extends Extension {
         Main.panel.addToStatusArea(this.uuid, this._indicator, index, box);
 
         if (position === 'left-half') {
-            // The panel boxes can't place an item at an arbitrary point, so keep it in the
-            // left box and slide it over visually. Translation doesn't affect layout, and
-            // both input picking and the menu's anchor follow the transformed position.
+            // Panel items can't stretch, so size the lyric to reach from where it starts
+            // in the left box up to the clock in the center box. Resizing during the
+            // allocation it reacts to would relayout mid-layout, so wait for it to finish.
             const container = this._indicator.container;
-            this._allocationId = container.connect('notify::allocation', () => this._centerInLeftHalf());
-            this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', () => this._centerInLeftHalf());
+            const queueFill = () => {
+                this._fillLaterId ??= global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
+                    this._fillLaterId = null;
+                    this._fillLeftOfClock();
+                    return GLib.SOURCE_REMOVE;
+                });
+            };
+            this._allocationId = container.connect('notify::allocation', queueFill);
+            this._centerAllocationId = Main.panel._centerBox.connect('notify::allocation', queueFill);
+            this._monitorsChangedId = Main.layoutManager.connect('monitors-changed', queueFill);
         }
     }
 
-    _centerInLeftHalf() {
-        const container = this._indicator?.container;
-        const monitor = Main.layoutManager.primaryMonitor;
-        if (!container || !monitor) {
+    _fillLeftOfClock() {
+        const indicator = this._indicator;
+        if (!indicator) {
             return;
         }
 
-        const [stageX] = container.get_transformed_position();
-        const naturalX = stageX - container.translation_x;
-        const targetX = monitor.x + monitor.width * 0.25 - container.width / 2;
-        // Only ever move right, so it can't slide over the Activities button
-        container.translation_x = Math.round(Math.max(0, targetX - naturalX));
+        // From layout positions within the panel, as on-screen ones are thrown off
+        // by transitions such as the startup zoom
+        const container = indicator.container;
+        const containerX = container.get_parent().allocation.x1 + container.allocation.x1;
+        const centerX = Main.panel._centerBox.allocation.x1;
+        // Whatever the panel button adds around the label, such as its padding
+        const [, containerWidth] = container.get_preferred_width(-1);
+        const overhead = containerWidth - indicator.labelWidth;
+        indicator.setLabelWidth(Math.max(LABEL_MIN_FILL_WIDTH_PX, centerX - CLOCK_GAP_PX - containerX - overhead));
     }
 
     _destroyIndicator() {
+        if (this._fillLaterId) {
+            global.compositor.get_laters().remove(this._fillLaterId);
+            this._fillLaterId = null;
+        }
         if (this._monitorsChangedId) {
             Main.layoutManager.disconnect(this._monitorsChangedId);
             this._monitorsChangedId = null;
+        }
+        if (this._centerAllocationId) {
+            Main.panel._centerBox.disconnect(this._centerAllocationId);
+            this._centerAllocationId = null;
         }
         if (this._allocationId) {
             this._indicator?.container.disconnect(this._allocationId);

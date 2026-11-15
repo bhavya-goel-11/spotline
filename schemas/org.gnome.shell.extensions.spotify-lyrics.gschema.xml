@@ -4,7 +4,7 @@
     <key name="position-in-panel" type="s">
       <default>'left-half'</default>
       <summary>Position in Panel</summary>
-      <description>Where to place the indicator in the panel (left, center, right, left-half)</description>
+      <description>Where to place the indicator in the panel (left, center, right, or left-half, which fills the space up to the clock)</description>
       <choices>
         <choice value='left'/>
         <choice value='center'/>
@@ -12,17 +12,31 @@
         <choice value='left-half'/>
       </choices>
     </key>
-    <key name="max-text-length" type="i">
-      <default>80</default>
-      <range min="10" max="200"/>
-      <summary>Max Text Length</summary>
-      <description>Maximum capacity of text to display</description>
-    </key>
     <key name="lyrics-offset" type="i">
       <default>400</default>
       <range min="-2000" max="2000"/>
       <summary>Lyrics Lookahead Offset</summary>
       <description>Time in milliseconds to show lyrics before they are sung</description>
+    </key>
+    <key name="show-lyrics" type="b">
+      <default>true</default>
+      <summary>Show Lyrics</summary>
+      <description>Show synced lyrics in the top bar and over the album art</description>
+    </key>
+    <key name="show-album-art" type="b">
+      <default>true</default>
+      <summary>Show Album Art</summary>
+      <description>Show the album art in the dropdown</description>
+    </key>
+    <key name="sharper-album-art" type="b">
+      <default>true</default>
+      <summary>Sharper Album Art</summary>
+      <description>When a player only provides a small cover, look for a larger copy on Apple's iTunes service, which sends it the song's title and artist</description>
+    </key>
+    <key name="refresh-player-request" type="i">
+      <default>0</default>
+      <summary>Refresh Player request</summary>
+      <description>Bumped by the preferences window to make the extension look for the active player again</description>
     </key>
   </schema>
 </schemalist>

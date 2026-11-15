@@ -1,14 +1,102 @@
 .spotify-lyrics-label {
+    /* The current line; the upcoming one on the album art matches its size */
     font-size: 13px;
-    font-weight: 500;
+    font-weight: bold;
     padding: 0 12px;
-    /* Fixed width so the indicator never shifts or resizes between songs/lyric lines */
-    width: 320px;
+    /* Width is set in extension.js: fixed, or filling up to the clock */
     text-align: center;
     color: #ffffff;
 }
 
-/* Fixed-width dropdown; long track names wrap instead of stretching it */
-.spotline-menu {
-    width: 300px;
+/* Dropdown width is pinned to the indicator in extension.js; long track
+   names wrap instead of stretching it */
+
+/* The dropdown is a single card (see _buildMenu); with album art the cover
+   fills it edge to edge, so the menu's own padding and border are dropped
+   and one radius is shared by the menu, the card and the cover */
+.popup-menu-content.spotline-menu {
+    padding: 0;
+    border-width: 0;
+    border-radius: 18px;
+}
+
+.spotline-card-item {
+    padding: 0;
+    spacing: 0;
+    border-radius: 18px;
+}
+
+.spotline-card {
+    border-radius: 18px;
+}
+
+.spotline-album-art {
+    border-radius: 18px;
+    background-size: cover;
+}
+
+.spotline-cover-bottom-shade {
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(0, 0, 0, 0);
+    background-gradient-end: rgba(0, 0, 0, 0.92);
+    border-radius: 0 0 18px 18px;
+}
+
+.spotline-card-content {
+    padding: 14px 18px 16px;
+    spacing: 12px;
+}
+
+.spotline-controls {
+    spacing: 12px;
+}
+
+/* Translucent, so they work both over the cover and on the plain menu */
+.spotline-control {
+    padding: 8px 22px;
+    border-radius: 999px;
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.14);
+}
+
+.spotline-control:hover,
+.spotline-control:focus {
+    background-color: rgba(255, 255, 255, 0.24);
+}
+
+.spotline-control:active {
+    background-color: rgba(255, 255, 255, 0.32);
+}
+
+/* Explicit colors, as the non-interactive track item is otherwise dimmed */
+.spotline-track-title {
+    font-weight: bold;
+    color: #f2f2f2;
+}
+
+.spotline-track-artist {
+    font-size: 0.9em;
+    color: #e0e0e0;
+    padding-top: 2px;
+}
+
+/* Upcoming lyric line at the top of the album art */
+.spotline-art-lyrics-shade {
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(0, 0, 0, 0.9);
+    background-gradient-end: rgba(0, 0, 0, 0);
+    border-radius: 18px 18px 0 0;
+}
+
+.spotline-art-lyrics {
+    padding: 16px 20px 0;
+}
+
+.spotline-art-lyric {
+    /* Same size as the current line in the top bar, but regular and faded;
+       scaled up with a wider dropdown in extension.js */
+    font-size: 13px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.78);
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }

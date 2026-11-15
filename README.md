@@ -6,6 +6,7 @@ A GNOME Shell extension that displays the currently playing song from Spotify, Y
 
 - **Real-time synced lyrics** - Shows the current line of lyrics synchronized with playback
 - **Multi-player support** - Works with Spotify, YouTube Music, and other MPRIS players
+- **Album art** - Fills the dropdown for any player that provides a cover. Small covers, such as the ones browsers provide, are replaced with a larger copy from Apple's iTunes service, which receives the song's title and artist; turn off *Sharper Album Art* in the preferences to disable this
 - Automatically fetches lyrics from LRCLIB (free, no API key required)
 - Falls back to song name and artist if lyrics aren't available
 - Updates in real-time as the song plays
