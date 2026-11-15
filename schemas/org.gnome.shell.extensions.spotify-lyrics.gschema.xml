@@ -26,12 +26,7 @@
     <key name="show-album-art" type="b">
       <default>true</default>
       <summary>Show Album Art</summary>
-      <description>Show the album art in the dropdown</description>
-    </key>
-    <key name="sharper-album-art" type="b">
-      <default>true</default>
-      <summary>Sharper Album Art</summary>
-      <description>When a player only provides a small cover, look for a larger copy on Apple's iTunes service, which sends it the song's title and artist</description>
+      <description>Show the album art in the dropdown (Spotify only)</description>
     </key>
     <key name="toggle-menu-shortcut" type="as">
       <default><![CDATA[['<Super>z']]]></default>

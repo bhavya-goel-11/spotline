@@ -3,7 +3,6 @@ import St from 'gi://St';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
-import GdkPixbuf from 'gi://GdkPixbuf';
 import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
 import Shell from 'gi://Shell';
@@ -25,9 +24,9 @@ const CLOCK_GAP_PX = 8;
 const LABEL_MIN_FILL_WIDTH_PX = 200;
 // Space kept above and below the dropdown when the square would not fit on screen
 const MENU_SCREEN_MARGIN_PX = 24;
-// Dropdown width the track title, artist, playback buttons and the card's padding
-// keep their stylesheet size at (the default 344px label in its panel button); a wider dropdown scales them
-// up to match
+// Dropdown width the track title, artist and the card's padding keep their
+// stylesheet size at (the default 344px label in its panel button); a wider
+// dropdown scales them up to match
 const CARD_BASE_WIDTH_PX = 368;
 const MPRIS_PLAYER_INTERFACE = 'org.mpris.MediaPlayer2.Player';
 
@@ -50,88 +49,14 @@ const ALBUM_ART_CROSSFADE_MS = 300;
 const ART_LYRICS_SCROLL_MS = 450;
 // Upper bound on waiting for St to drop a rewritten cover from its texture cache
 const ALBUM_ART_RELOAD_TIMEOUT_MS = 500;
-// Covers are read into the shell's memory, and players choose what artUrl points at
+// Covers are read into the shell's memory, so cap what a download may be
 const ALBUM_ART_MAX_BYTES = 20 * 1024 * 1024;
-// Browsers hand over 150px covers, which look soft stretched across the dropdown;
-// anything under this size is worth looking for a sharper copy of
-const ALBUM_ART_SHARP_SIZE = 300;
-const ALBUM_ART_SMALL_MAX_BYTES = 300 * 1024;
-const ITUNES_SEARCH_URL = 'https://itunes.apple.com/search';
-const ITUNES_ART_SIZE = '600x600bb';
+// Only the Spotify app gets album art; other players' covers are often small or missing
+const SPOTIFY_BUS_NAME = 'org.mpris.MediaPlayer2.spotify';
 
 // Older Spotify builds report a dead open.spotify.com host for the same image
 function normalizeAlbumArtUrl(artUrl) {
     return artUrl?.replace('https://open.spotify.com/image/', 'https://i.scdn.co/image/') || null;
-}
-
-function isSmallCover(bytes) {
-    // A file this big isn't a small image, and decoding it would stall the shell
-    if (bytes.get_size() > ALBUM_ART_SMALL_MAX_BYTES) {
-        return false;
-    }
-    try {
-        const loader = new GdkPixbuf.PixbufLoader();
-        loader.write_bytes(bytes);
-        loader.close();
-        const pixbuf = loader.get_pixbuf();
-        return Math.min(pixbuf.get_width(), pixbuf.get_height()) < ALBUM_ART_SHARP_SIZE;
-    } catch (e) {
-        return false;
-    }
-}
-
-// Lowercased with "(feat. ...)" style suffixes and punctuation gone, so J-Star matches Jstar
-function normalizeMatchText(text) {
-    return (text ?? '').toLowerCase()
-        .replace(/[([].*?[)\]]/g, '')
-        .replace(/[^\p{L}\p{N}]/gu, '');
-}
-
-// A wrong cover is worse than a soft one. Title and artist must match, and since a
-// remix or cover version can share those, the album or the length has to confirm it.
-function findMatchingRelease(results, track) {
-    const title = normalizeMatchText(track.title);
-    const artist = normalizeMatchText(track.artist);
-    const album = normalizeMatchText(track.album);
-    if (!title || !artist) {
-        return null;
-    }
-
-    const matches = results.filter(result => {
-        const resultArtist = normalizeMatchText(result.artistName);
-        return result.artworkUrl100 && resultArtist &&
-            normalizeMatchText(result.trackName) === title &&
-            (resultArtist.includes(artist) || artist.includes(resultArtist));
-    });
-
-    const sameAlbum = album && matches.find(result => normalizeMatchText(result.collectionName) === album);
-    if (sameAlbum) {
-        return sameAlbum;
-    }
-
-    const lengthGap = result => Math.abs(result.trackTimeMillis / 1000 - track.duration);
-    return matches
-        .filter(result => track.duration > 0 && lengthGap(result) <= LYRICS_DURATION_TOLERANCE_S)
-        .sort((a, b) => lengthGap(a) - lengthGap(b))[0] ?? null;
-}
-
-// iTunes catalogs differ by country and many songs are in only one, so start with
-// where the machine is (the timezone is a better hint than a language like en_US)
-function itunesCountries() {
-    const countries = [];
-    try {
-        const timezone = GLib.TimeZone.new_local().get_identifier();
-        const [, contents] = GLib.file_get_contents('/usr/share/zoneinfo/zone.tab');
-        const zone = new TextDecoder().decode(contents).split('\n')
-            .find(line => line.split('\t')[2] === timezone);
-        if (zone) {
-            countries.push(zone.slice(0, 2));
-        }
-    } catch (e) {
-        // Not every system has the file; the language and US below still work
-    }
-    const language = GLib.get_language_names()[0]?.match(/_([A-Z]{2})/)?.[1];
-    return [...new Set([...countries, language, 'US'].filter(Boolean))];
 }
 
 // Widget that can be made as tall as it is wide, for the album art card
@@ -252,11 +177,6 @@ const MusicLyricsIndicator = GObject.registerClass(
                 'album-art'
             ]);
             this._albumArtUrl = null;
-            this._albumArtSourceUrl = null;
-            this._smallArtSourceUrl = null;
-            // Sharper cover URL per track, or null when there isn't one
-            this._sharperArtUrls = new Map();
-            this._durationPending = false;
             this._albumArtReady = false;
             this._showAlbumArt = this._settings.get_boolean('show-album-art');
             this._albumArtExpanded = false;
@@ -310,9 +230,6 @@ const MusicLyricsIndicator = GObject.registerClass(
                 this._settings.connect('changed::show-album-art', () => {
                     this._showAlbumArt = this._settings.get_boolean('show-album-art');
                     this._syncAlbumArt();
-                }),
-                this._settings.connect('changed::sharper-album-art', () => {
-                    this._updateTrackInfo();
                 }),
                 this._settings.connect('changed::refresh-player-request', () => {
                     this._findActivePlayer();
@@ -393,7 +310,7 @@ const MusicLyricsIndicator = GObject.registerClass(
                 bottomShade.height = Math.round(card.width * 0.65);
             });
             // From the allocation, as width reports the natural size while a layout is pending
-            card.connect('notify::allocation', () => this._scaleCardControls(card.allocation.get_width()));
+            card.connect('notify::allocation', () => this._scaleCardText(card.allocation.get_width()));
 
             // Upcoming lyric at the top of the cover (the current one is in the
             // top bar); on each new line it slides up out of the cover, towards the bar
@@ -480,35 +397,28 @@ const MusicLyricsIndicator = GObject.registerClass(
             content.add_child(controlsBox);
 
             card.add_child(content);
-            this._controlsBox = controlsBox;
             this._cardContent = content;
         }
 
-        // Scales the track title, artist, playback buttons and the padding and spacing
-        // around them (not the upcoming lyric) with the card's width
-        _scaleCardControls(width) {
+        // Scales the track title, artist and the padding and spacing around them with
+        // the card's width; the playback buttons and upcoming lyric keep their size
+        _scaleCardText(width) {
             const scale = Math.max(1, width / CARD_BASE_WIDTH_PX);
             const percent = Math.round(scale * 100);
-            if (percent === this._cardControlsPercent) {
+            if (percent === this._cardTextPercent) {
                 return;
             }
-            this._cardControlsPercent = percent;
+            this._cardTextPercent = percent;
             const base = percent === 100;
             const px = v => `${Math.round(v * scale)}px`;
 
             // Title and artist inherit the box's font, so a percentage scales them from
             // the theme's size
             this._trackTextBox.style = base ? null : `font-size: ${percent}%;`;
-            // Spacing, padding and icon size mirror stylesheet.css and makeControlButton.
-            // The margins grow with the card and the gap above the buttons a bit more,
-            // so the larger title and buttons don't crowd each other or the edges.
+            // Padding and spacing mirror stylesheet.css. The margins grow with the card and
+            // the gap above the buttons a bit more, so the larger title doesn't crowd them.
             this._cardContent.style = base ? null
                 : `padding: ${px(14)} ${px(18)} ${px(16)}; spacing: ${px(16)};`;
-            this._controlsBox.style = base ? null : `spacing: ${px(12)};`;
-            for (const button of [this._prevButton, this._playPauseButton, this._nextButton]) {
-                button.style = base ? null : `padding: ${px(8)} ${px(22)};`;
-                button.child.icon_size = Math.round(20 * scale);
-            }
         }
 
         _controlPlayback(action) {
@@ -808,24 +718,17 @@ const MusicLyricsIndicator = GObject.registerClass(
                     }
                 }
 
-                const artUrl = normalizeAlbumArtUrl(metadataDict['mpris:artUrl']?.deep_unpack());
+                const artUrl = this._currentBusName === SPOTIFY_BUS_NAME
+                    ? normalizeAlbumArtUrl(metadataDict['mpris:artUrl']?.deep_unpack())
+                    : null;
+                this._updateAlbumArt(artUrl);
 
-                // If both title and artist are missing, show icon or nothing. Browsers
-                // send a track change as a burst of updates starting with just the new
-                // cover, so this has to pass that on rather than dropping the art.
+                // If both title and artist are missing, show icon or nothing
                 if (title === 'Unknown Track' && artist === 'Unknown Artist') {
                     this._updateLabelText('♪');
                     this._setTrackInfo('Unknown track');
-                    this._albumArtSourceUrl = artUrl;
-                    this._updateAlbumArt(artUrl);
                     return;
                 }
-
-                this._albumArtSourceUrl = artUrl;
-                const sharperArtUrl = artUrl && this._settings.get_boolean('sharper-album-art')
-                    ? this._sharperArtUrls.get(this._getLyricsCacheKey(title, artist))
-                    : null;
-                this._updateAlbumArt(sharperArtUrl || artUrl);
 
                 // Check if lyrics query inputs changed to avoid redundant API calls
                 const lyricsQueryChanged = forceFetch ||
@@ -841,8 +744,6 @@ const MusicLyricsIndicator = GObject.registerClass(
                     duration: duration
                 };
 
-                this._durationPending = durationPending;
-                this._maybeFindSharperArt();
 
                 // Update menu with track info
                 this._setTrackInfo(this._currentTrack.title, this._currentTrack.artist);
@@ -925,9 +826,7 @@ const MusicLyricsIndicator = GObject.registerClass(
                 return;
             }
 
-            // Browsers and local players hand over a file, Spotify a web URL and
-            // some players (mpv) embed the image in a data URI
-            this._loadAlbumArtBytes(url).then(bytes => {
+            this._downloadAlbumArt(url).then(bytes => {
                 if (this._isDestroyed || url !== this._albumArtUrl) {
                     return;
                 }
@@ -935,24 +834,11 @@ const MusicLyricsIndicator = GObject.registerClass(
                     throw new Error('Album art is empty');
                 }
                 this._queueArtSwap(bytes);
-
-                if (url === this._albumArtSourceUrl && isSmallCover(bytes)) {
-                    this._smallArtSourceUrl = url;
-                    this._maybeFindSharperArt();
-                }
             }).catch(e => {
                 if (this._isDestroyed || url !== this._albumArtUrl) {
                     return;
                 }
                 logError(e, 'Failed to load album art');
-
-                // A sharper copy that won't load is no reason to lose the player's own
-                if (this._albumArtSourceUrl && url !== this._albumArtSourceUrl && this._currentTrack) {
-                    const {title, artist} = this._currentTrack;
-                    this._sharperArtUrls.set(this._getLyricsCacheKey(title, artist), null);
-                    this._updateAlbumArt(this._albumArtSourceUrl);
-                    return;
-                }
 
                 // Better no cover than the previous song's
                 this._cancelArtSwap();
@@ -961,103 +847,11 @@ const MusicLyricsIndicator = GObject.registerClass(
             });
         }
 
-        // Runs from both the metadata and the cover loading, as a browser's track
-        // change only has the small cover and the track's details after a moment
-        _maybeFindSharperArt() {
-            const track = this._currentTrack;
-            if (!track || this._durationPending || !this._albumArtSourceUrl ||
-                this._smallArtSourceUrl !== this._albumArtSourceUrl ||
-                !this._settings.get_boolean('sharper-album-art')) {
-                return;
-            }
-
-            const key = this._getLyricsCacheKey(track.title, track.artist);
-            if (this._sharperArtUrls.has(key)) {
-                return;
-            }
-            this._sharperArtUrls.set(key, null);
-
-            const isStillCurrent = () => !this._isDestroyed && this._currentTrack &&
-                this._getLyricsCacheKey(this._currentTrack.title, this._currentTrack.artist) === key;
-
-            this._lookupSharperArt(track).then(url => {
-                if (this._isDestroyed || !url) {
-                    return;
-                }
-                this._sharperArtUrls.set(key, url);
-                if (isStillCurrent() && this._albumArtSourceUrl &&
-                    this._settings.get_boolean('sharper-album-art')) {
-                    this._updateAlbumArt(url);
-                }
-            }).catch(e => {
-                if (this._isDestroyed) {
-                    return;
-                }
-                // Probably offline: let the next play of this track try again
-                this._sharperArtUrls.delete(key);
-                logError(e, 'Failed to look up sharper album art');
-            });
-        }
-
-        async _lookupSharperArt(track) {
-            this._itunesCountries ??= itunesCountries();
-            for (const country of this._itunesCountries) {
-                // eslint-disable-next-line no-await-in-loop
-                const data = await this._requestJson(ITUNES_SEARCH_URL, {
-                    term: `${track.artist} ${track.title}`,
-                    entity: 'song',
-                    limit: 25,
-                    country
-                });
-                const release = findMatchingRelease(data?.results ?? [], track);
-                if (release) {
-                    return release.artworkUrl100.replace(/\/\d+x\d+bb/, `/${ITUNES_ART_SIZE}`);
-                }
-            }
-            return null;
-        }
-
-        async _loadAlbumArtBytes(url) {
-            if (url.startsWith('file://')) {
-                return this._readAlbumArtFile(url);
-            }
-            if (url.startsWith('http://') || url.startsWith('https://')) {
-                return this._downloadAlbumArt(url);
-            }
-            if (url.startsWith('data:')) {
-                return Soup.uri_decode_data_uri(url)[0];
-            }
-            throw new Error(`Unsupported album art URL: ${url.slice(0, 40)}`);
-        }
-
-        _readAlbumArtFile(url) {
-            const file = Gio.File.new_for_uri(url);
-            return new Promise((resolve, reject) => {
-                file.query_info_async('standard::type,standard::size', Gio.FileQueryInfoFlags.NONE,
-                    GLib.PRIORITY_DEFAULT, null, (source, infoResult) => {
-                        try {
-                            // Regular files only: reading a device could never finish
-                            const info = source.query_info_finish(infoResult);
-                            if (info.get_file_type() !== Gio.FileType.REGULAR ||
-                                info.get_size() > ALBUM_ART_MAX_BYTES) {
-                                throw new Error('Album art file is not a usable size or type');
-                            }
-                        } catch (e) {
-                            reject(e);
-                            return;
-                        }
-                        source.load_bytes_async(null, (loaded, loadResult) => {
-                            try {
-                                resolve(loaded.load_bytes_finish(loadResult)[0]);
-                            } catch (e) {
-                                reject(e);
-                            }
-                        });
-                    });
-            });
-        }
-
+        // Spotify hands over a web URL for the cover
         _downloadAlbumArt(url) {
+            if (!url.startsWith('https://') && !url.startsWith('http://')) {
+                return Promise.reject(new Error(`Unsupported album art URL: ${url.slice(0, 40)}`));
+            }
             const msg = Soup.Message.new('GET', url);
             const cancellable = new Gio.Cancellable();
             msg.connect('got-headers', () => {

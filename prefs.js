@@ -60,18 +60,10 @@ export default class SpotLinePreferences extends ExtensionPreferences {
 
         const albumArtRow = new Adw.SwitchRow({
             title: 'Show Album Art',
-            subtitle: 'Cover art in the dropdown'
+            subtitle: 'Cover art in the dropdown, for Spotify'
         });
         settings.bind('show-album-art', albumArtRow, 'active', Gio.SettingsBindFlags.DEFAULT);
         displayGroup.add(albumArtRow);
-
-        const sharperArtRow = new Adw.SwitchRow({
-            title: 'Sharper Album Art',
-            subtitle: 'For small covers, such as from browsers, find a larger copy on Apple’s iTunes service. Sends it the song’s title and artist.'
-        });
-        settings.bind('sharper-album-art', sharperArtRow, 'active', Gio.SettingsBindFlags.DEFAULT);
-        settings.bind('show-album-art', sharperArtRow, 'sensitive', Gio.SettingsBindFlags.GET);
-        displayGroup.add(sharperArtRow);
 
         page.add(displayGroup);
 
