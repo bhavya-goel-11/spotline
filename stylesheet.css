@@ -35,10 +35,19 @@
     background-size: cover;
 }
 
-.spotline-cover-bottom-shade {
+/* Shade style (see _syncTrackInfoStyle): fade from the cover into the backing below */
+.spotline-cover-bottom-fade {
     background-gradient-direction: vertical;
     background-gradient-start: rgba(0, 0, 0, 0);
-    background-gradient-end: rgba(0, 0, 0, 0.92);
+    background-gradient-end: rgba(0, 0, 0, 0.6);
+}
+
+/* Spans the title, artist and buttons, dark enough for white text even on
+   an all-white cover */
+.spotline-cover-bottom-shade {
+    background-gradient-direction: vertical;
+    background-gradient-start: rgba(0, 0, 0, 0.6);
+    background-gradient-end: rgba(0, 0, 0, 0.85);
     border-radius: 0 0 18px 18px;
 }
 
@@ -72,12 +81,22 @@
 .spotline-track-title {
     font-weight: bold;
     color: #f2f2f2;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.9);
 }
 
 .spotline-track-artist {
     font-size: 0.9em;
     color: #e0e0e0;
     padding-top: 2px;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+/* Invert style: pure white and no shadow, which the invert blend (see
+   InvertBlendEffect) turns into the exact inverse of the cover beneath */
+.spotline-invert .spotline-track-title,
+.spotline-invert .spotline-track-artist {
+    color: #ffffff;
+    text-shadow: none;
 }
 
 /* Upcoming lyric line at the top of the album art */

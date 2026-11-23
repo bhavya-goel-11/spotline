@@ -65,6 +65,20 @@ export default class SpotLinePreferences extends ExtensionPreferences {
         settings.bind('show-album-art', albumArtRow, 'active', Gio.SettingsBindFlags.DEFAULT);
         displayGroup.add(albumArtRow);
 
+        const trackInfoRow = new Adw.ComboRow({
+            title: 'Track Info Style',
+            subtitle: 'How the title, artist and buttons stay readable over the cover',
+            model: new Gtk.StringList({
+                strings: ['Dark Shade', 'Invert Colors']
+            })
+        });
+        const trackInfoStyles = ['shade', 'invert'];
+        trackInfoRow.selected = Math.max(0, trackInfoStyles.indexOf(settings.get_string('track-info-style')));
+        trackInfoRow.connect('notify::selected', () => {
+            settings.set_string('track-info-style', trackInfoStyles[trackInfoRow.selected]);
+        });
+        displayGroup.add(trackInfoRow);
+
         page.add(displayGroup);
 
         const playerGroup = new Adw.PreferencesGroup({title: 'Player'});

@@ -75,6 +75,29 @@ const SquareWidget = GObject.registerClass(
         }
     });
 
+// Draws its (white) actor so each fully covered pixel becomes the exact inverse
+// of whatever is beneath it (a difference blend: src + dst - 2 * src * dst),
+// antialiased edges partly so, and transparent pixels leave it as is
+const InvertBlendEffect = GObject.registerClass(
+    class InvertBlendEffect extends Clutter.OffscreenEffect {
+        // The pipeline that draws the offscreen copy is created on first paint (and
+        // again when the actor's size changes), so the blend is set just before use
+        vfunc_paint_target(node, paintContext) {
+            const pipeline = this.get_pipeline();
+            if (pipeline && pipeline !== this._blendedPipeline) {
+                // Everything drawn through this effect is white (premultiplied, so its
+                // color equals its alpha), which makes SRC_COLOR[A] stand in for
+                // SRC_COLOR; Cogl's parser rejects (1-SRC_COLOR) on the destination side
+                // Color is inverted; alpha composites as usual, so the menu stays opaque
+                // when it is drawn through an offscreen buffer
+                pipeline.set_blend('RGB = ADD (SRC_COLOR*(1-DST_COLOR), DST_COLOR*(1-SRC_COLOR[A])) ' +
+                    'A = ADD (SRC_COLOR, DST_COLOR*(1-SRC_COLOR[A]))');
+                this._blendedPipeline = pipeline;
+            }
+            super.vfunc_paint_target(node, paintContext);
+        }
+    });
+
 function newVerticalBox(params) {
     const box = new St.BoxLayout(params);
     if ('orientation' in box) {
@@ -231,6 +254,9 @@ const MusicLyricsIndicator = GObject.registerClass(
                     this._showAlbumArt = this._settings.get_boolean('show-album-art');
                     this._syncAlbumArt();
                 }),
+                this._settings.connect('changed::track-info-style', () => {
+                    this._syncTrackInfoStyle();
+                }),
                 this._settings.connect('changed::refresh-player-request', () => {
                     this._findActivePlayer();
                 })
@@ -296,18 +322,27 @@ const MusicLyricsIndicator = GObject.registerClass(
                 y_align: Clutter.ActorAlign.START,
                 visible: false
             });
-            const bottomShade = new St.Widget({
-                style_class: 'spotline-cover-bottom-shade',
+            // Shade style: behind the title, artist and buttons, a dark backing that
+            // always spans exactly their area (however many lines the title wraps to),
+            // so they stay readable on light covers, plus a fade above it into the cover
+            const bottomShades = this._bottomShades = newVerticalBox({
                 x_expand: true,
                 y_expand: true,
                 y_align: Clutter.ActorAlign.END
             });
+            const bottomFade = new St.Widget({style_class: 'spotline-cover-bottom-fade', x_expand: true});
+            this._bottomShade = new St.Widget({
+                style_class: 'spotline-cover-bottom-shade',
+                x_expand: true
+            });
+            bottomShades.add_child(bottomFade);
+            bottomShades.add_child(this._bottomShade);
             this._coverLayer.add_child(this._artLyricsShade);
-            this._coverLayer.add_child(bottomShade);
+            this._coverLayer.add_child(bottomShades);
             card.add_child(this._coverLayer);
             card.connect('notify::width', () => {
                 this._artLyricsShade.height = Math.round(card.width * 0.42);
-                bottomShade.height = Math.round(card.width * 0.65);
+                bottomFade.height = Math.round(card.width * 0.16);
             });
             // From the allocation, as width reports the natural size while a layout is pending
             card.connect('notify::allocation', () => this._scaleCardText(card.allocation.get_width()));
@@ -350,7 +385,10 @@ const MusicLyricsIndicator = GObject.registerClass(
                 y_align: Clutter.ActorAlign.END
             });
 
+            // Invert style: no shade, the track info and buttons invert the cover instead
+            this._invertEffects = [new InvertBlendEffect(), new InvertBlendEffect()];
             const trackTextBox = this._trackTextBox = newVerticalBox({x_expand: true});
+            trackTextBox.add_effect(this._invertEffects[0]);
             this._trackTitleLabel = new St.Label({style_class: 'spotline-track-title'});
             this._trackArtistLabel = new St.Label({style_class: 'spotline-track-artist'});
             for (const label of [this._trackTitleLabel, this._trackArtistLabel]) {
@@ -394,10 +432,40 @@ const MusicLyricsIndicator = GObject.registerClass(
             controlsBox.add_child(prevButton);
             controlsBox.add_child(playPauseButton);
             controlsBox.add_child(nextButton);
+            controlsBox.add_effect(this._invertEffects[1]);
             content.add_child(controlsBox);
 
             card.add_child(content);
             this._cardContent = content;
+
+            // Match the backing's height to the content's, after layout, as sizes
+            // can't change during an allocation
+            content.connect('notify::allocation', () => {
+                this._shadeLaterId ??= global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
+                    this._shadeLaterId = null;
+                    const height = Math.ceil(this._cardContent.allocation.get_height());
+                    if (this._bottomShade.height !== height) {
+                        this._bottomShade.height = height;
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
+            });
+            this._syncTrackInfoStyle();
+        }
+
+        // Shade: a dark backing behind the track info and buttons. Invert: no
+        // backing, and they invert the colors of the cover beneath them.
+        _syncTrackInfoStyle() {
+            const invert = this._settings.get_string('track-info-style') === 'invert';
+            this._bottomShades.visible = !invert;
+            for (const effect of this._invertEffects) {
+                effect.enabled = invert;
+            }
+            if (invert) {
+                this._cardContent.add_style_class_name('spotline-invert');
+            } else {
+                this._cardContent.remove_style_class_name('spotline-invert');
+            }
         }
 
         // Scales the track title, artist and the padding and spacing around them with
@@ -1583,6 +1651,10 @@ const MusicLyricsIndicator = GObject.registerClass(
 
         destroy() {
             this._isDestroyed = true;
+            if (this._shadeLaterId) {
+                global.compositor.get_laters().remove(this._shadeLaterId);
+                this._shadeLaterId = null;
+            }
 
             if (this._offsetSignalId) {
                 this._settings.disconnect(this._offsetSignalId);

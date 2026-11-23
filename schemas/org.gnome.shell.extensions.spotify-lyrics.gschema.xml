@@ -28,6 +28,15 @@
       <summary>Show Album Art</summary>
       <description>Show the album art in the dropdown (Spotify only)</description>
     </key>
+    <key name="track-info-style" type="s">
+      <default>'shade'</default>
+      <choices>
+        <choice value='shade'/>
+        <choice value='invert'/>
+      </choices>
+      <summary>Track Info Style</summary>
+      <description>How the title, artist and buttons stay readable over the album art: a dark shade behind them, or colors that invert the cover beneath</description>
+    </key>
     <key name="toggle-menu-shortcut" type="as">
       <default><![CDATA[['<Super>z']]]></default>
       <summary>Dropdown Shortcut</summary>
