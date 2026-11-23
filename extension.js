@@ -386,7 +386,8 @@ const MusicLyricsIndicator = GObject.registerClass(
             });
 
             // Invert style: no shade, the track info and buttons invert the cover instead
-            this._invertEffects = [new InvertBlendEffect(), new InvertBlendEffect()];
+            this._invertEffects = [new InvertBlendEffect(), new InvertBlendEffect(), new InvertBlendEffect()];
+            this._artLyricsBox.add_effect(this._invertEffects[2]);
             const trackTextBox = this._trackTextBox = newVerticalBox({x_expand: true});
             trackTextBox.add_effect(this._invertEffects[0]);
             this._trackTitleLabel = new St.Label({style_class: 'spotline-track-title'});
@@ -456,16 +457,19 @@ const MusicLyricsIndicator = GObject.registerClass(
         // Shade: a dark backing behind the track info and buttons. Invert: no
         // backing, and they invert the colors of the cover beneath them.
         _syncTrackInfoStyle() {
-            const invert = this._settings.get_string('track-info-style') === 'invert';
+            const invert = this._invertStyle = this._settings.get_string('track-info-style') === 'invert';
             this._bottomShades.visible = !invert;
             for (const effect of this._invertEffects) {
                 effect.enabled = invert;
             }
-            if (invert) {
-                this._cardContent.add_style_class_name('spotline-invert');
-            } else {
-                this._cardContent.remove_style_class_name('spotline-invert');
+            for (const widget of [this._cardContent, this._artLyricsBox]) {
+                if (invert) {
+                    widget.add_style_class_name('spotline-invert');
+                } else {
+                    widget.remove_style_class_name('spotline-invert');
+                }
             }
+            this._syncArtLyricsVisible();
         }
 
         // Scales the track title, artist and the padding and spacing around them with
@@ -1062,8 +1066,10 @@ const MusicLyricsIndicator = GObject.registerClass(
 
         // The upcoming lyric only shows on top of the cover
         _syncArtLyricsVisible() {
-            this._artLyricsBox.visible = this._artLyricsShade.visible =
-                this._artLyricsActive && this._albumArtExpanded;
+            const visible = this._artLyricsActive && this._albumArtExpanded;
+            this._artLyricsBox.visible = visible;
+            // The invert style needs no shade behind it
+            this._artLyricsShade.visible = visible && !this._invertStyle;
         }
 
         _clearLyrics() {

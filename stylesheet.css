@@ -118,3 +118,9 @@
     color: rgba(255, 255, 255, 0.78);
     text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
+
+/* Invert style: see the track title */
+.spotline-invert .spotline-art-lyric {
+    color: #ffffff;
+    text-shadow: none;
+}
