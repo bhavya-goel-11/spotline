@@ -3,6 +3,8 @@ import St from 'gi://St';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
+import GdkPixbuf from 'gi://GdkPixbuf';
+import Cogl from 'gi://Cogl';
 import Meta from 'gi://Meta';
 import Pango from 'gi://Pango';
 import Shell from 'gi://Shell';
@@ -75,24 +77,239 @@ const SquareWidget = GObject.registerClass(
         }
     });
 
-// Draws its (white) actor so each fully covered pixel becomes the exact inverse
-// of whatever is beneath it (a difference blend: src + dst - 2 * src * dst),
-// antialiased edges partly so, and transparent pixels leave it as is
-const InvertBlendEffect = GObject.registerClass(
-    class InvertBlendEffect extends Clutter.OffscreenEffect {
-        // The pipeline that draws the offscreen copy is created on first paint (and
-        // again when the actor's size changes), so the blend is set just before use
+// Captures what the cover layer draws (the cover, mid-crossfade included) into a
+// texture that ContrastTextEffect samples
+const CoverCaptureEffect = GObject.registerClass(
+    class CoverCaptureEffect extends Clutter.OffscreenEffect {});
+
+// Max visibility: for every pixel of its actor's text, looks up the cover around
+// it (a 3x3 grid a few pixels apart, so the color doesn't flicker with JPEG noise
+// and holds up at edges) and colors the pixel with the first of the cover's own
+// palette colors (see extractCoverPalette) that reaches the minimum WCAG contrast
+// ratio against all of it, the lightest and the darkest spot alike. Where none
+// does, as on a nearly single-color cover, it takes the nearest
+// color that does: the palette color that needs the least change, lightened
+// (mixed with white) or darkened (mixed with black) in linear light, which keeps
+// its hue, just until it reaches the minimum. Only without a palette does it use
+// black or white, whichever contrasts more.
+const PALETTE_MAX_COLORS = 6;
+// The minimum contrast ratio a color needs: WCAG's for normal text
+const MAX_VISIBILITY_MIN_CONTRAST = 4.5;
+const CONTRAST_DECLARATIONS = `
+uniform vec4 spotline_map;
+uniform vec2 spotline_step;
+uniform float spotline_enabled;
+uniform vec4 spotline_palette[${PALETTE_MAX_COLORS}];
+uniform float spotline_palette_size;
+uniform float spotline_min_contrast;
+
+vec3 spotline_to_linear(vec3 rgb) {
+    return mix(rgb / 12.92, pow((rgb + 0.055) / 1.055, vec3(2.4)), step(0.04045, rgb));
+}
+
+vec3 spotline_to_srgb(vec3 rgb) {
+    return mix(rgb * 12.92, 1.055 * pow(rgb, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, rgb));
+}
+
+float spotline_luminance(vec4 color) {
+    vec3 rgb = color.a > 0.0 ? color.rgb / color.a : vec3(0.0);
+    return dot(spotline_to_linear(rgb), vec3(0.2126, 0.7152, 0.0722));
+}`;
+const CONTRAST_CODE = `
+if (spotline_enabled > 0.5) {
+    vec2 uv = spotline_map.xy + cogl_tex_coord_in[0].st * spotline_map.zw;
+    float luminance = 0.0;
+    float lightest = 0.0;
+    float darkest = 1.0;
+    for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+            float spot = spotline_luminance(
+                texture2D(cogl_sampler1, uv + vec2(float(x), float(y)) * spotline_step));
+            luminance += spot;
+            lightest = max(lightest, spot);
+            darkest = min(darkest, spot);
+        }
+    }
+    luminance /= 9.0;
+    // Without a palette, or where the cover around is too varied for any color to
+    // reach the minimum against all of it: black or white, blended over a narrow
+    // band around the break-even point so the switch doesn't leave a jagged edge
+    vec3 color = vec3(1.0 - smoothstep(0.15, 0.21, luminance));
+
+    // The luminances that just reach the minimum contrast above the lightest spot
+    // and below the darkest; lightening a color is mixing it with white, which
+    // raises its luminance linearly, and darkening scales it down
+    float lighter = spotline_min_contrast * (lightest + 0.05) - 0.05;
+    float darker = (darkest + 0.05) / spotline_min_contrast - 0.05;
+    // A color that is bumped aims a little past the minimum, so rounding to 8 bits
+    // per channel can't leave it just short
+    float bumpedLighter = spotline_min_contrast * 1.02 * (lightest + 0.05) - 0.05;
+    float bumpedDarker = (darkest + 0.05) / (spotline_min_contrast * 1.02) - 0.05;
+    vec3 nearest = color;
+    float nearestChange = 2.0;
+    for (int i = 0; i < ${PALETTE_MAX_COLORS}; i++) {
+        if (float(i) >= spotline_palette_size) {
+            break;
+        }
+        // Each entry is a color, in linear light, and its luminance
+        vec4 candidate = spotline_palette[i];
+        if (candidate.a >= lighter || candidate.a <= darker) {
+            nearest = candidate.rgb;
+            nearestChange = 0.0;
+            break;
+        }
+        if (bumpedLighter <= 1.0) {
+            float change = (bumpedLighter - candidate.a) / max(1.0 - candidate.a, 0.0001);
+            if (change < nearestChange) {
+                nearest = mix(candidate.rgb, vec3(1.0), change);
+                nearestChange = change;
+            }
+        }
+        if (bumpedDarker >= 0.0) {
+            float change = 1.0 - bumpedDarker / max(candidate.a, 0.0001);
+            if (change < nearestChange) {
+                nearest = candidate.rgb * (1.0 - change);
+                nearestChange = change;
+            }
+        }
+    }
+    if (nearestChange <= 1.0) {
+        color = spotline_to_srgb(nearest);
+    }
+    cogl_color_out.rgb = color * cogl_color_out.a;
+}`;
+// How far apart, in pixels, the cover is sampled around each text pixel
+const CONTRAST_SAMPLE_STEP_PX = 2;
+
+function toLinear(c) {
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+}
+
+// The cover's main colors, most characteristic first, as [r, g, b, luminance]
+// in linear light (0-1): a k-means clustering of a thumbnail, keeping clusters that cover a fair
+// share of it, ranked by share boosted by saturation so accents beat greys
+const PALETTE_SAMPLE_PX = 48;
+const PALETTE_CLUSTERS = 8;
+const PALETTE_MIN_SHARE = 0.03;
+const PALETTE_MERGE_DISTANCE = 0.12;
+function extractCoverPalette(bytes) {
+    const pixbuf = GdkPixbuf.Pixbuf.new_from_stream(Gio.MemoryInputStream.new_from_bytes(bytes), null)
+        .scale_simple(PALETTE_SAMPLE_PX, PALETTE_SAMPLE_PX, GdkPixbuf.InterpType.BILINEAR);
+    const data = pixbuf.read_pixel_bytes().toArray();
+    const points = [];
+    for (let y = 0; y < pixbuf.height; y++) {
+        for (let x = 0; x < pixbuf.width; x++) {
+            const i = y * pixbuf.rowstride + x * pixbuf.n_channels;
+            points.push([data[i] / 255, data[i + 1] / 255, data[i + 2] / 255]);
+        }
+    }
+    const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+    // Seeded with mutually distant points, so small vivid accents get a cluster
+    const centers = [points[0]];
+    while (centers.length < PALETTE_CLUSTERS) {
+        let farthest = null, farthestDistance = -1;
+        for (const p of points) {
+            const d = Math.min(...centers.map(c => distance(p, c)));
+            if (d > farthestDistance) {
+                farthest = p;
+                farthestDistance = d;
+            }
+        }
+        centers.push(farthest);
+    }
+    let counts = [];
+    for (let iteration = 0; iteration < 8; iteration++) {
+        const sums = centers.map(() => [0, 0, 0]);
+        counts = centers.map(() => 0);
+        for (const p of points) {
+            let best = 0;
+            for (let c = 1; c < centers.length; c++) {
+                if (distance(p, centers[c]) < distance(p, centers[best])) {
+                    best = c;
+                }
+            }
+            sums[best][0] += p[0];
+            sums[best][1] += p[1];
+            sums[best][2] += p[2];
+            counts[best]++;
+        }
+        centers.forEach((c, i) => {
+            if (counts[i] > 0) {
+                centers[i] = sums[i].map(v => v / counts[i]);
+            }
+        });
+    }
+
+    const clusters = centers
+        .map((color, i) => {
+            const share = counts[i] / points.length;
+            const saturation = Math.max(...color) - Math.min(...color);
+            return {color, share, score: share * (0.3 + saturation)};
+        })
+        .filter(c => c.share >= PALETTE_MIN_SHARE)
+        .sort((a, b) => b.score - a.score);
+    const palette = [];
+    for (const {color} of clusters) {
+        if (palette.length < PALETTE_MAX_COLORS &&
+            palette.every(p => distance(p, color) >= PALETTE_MERGE_DISTANCE)) {
+            palette.push(color);
+        }
+    }
+    return palette.map(color => {
+        const [r, g, b] = color.map(toLinear);
+        return [r, g, b, 0.2126 * r + 0.7152 * g + 0.0722 * b];
+    });
+}
+
+const ContrastTextEffect = GObject.registerClass(
+    class ContrastTextEffect extends Shell.GLSLEffect {
+        // getColors returns the cover's palette and the contrast its colors need
+        _init(coverActor, coverCapture, getColors) {
+            super._init();
+            this._coverActor = coverActor;
+            this._coverCapture = coverCapture;
+            this._getColors = getColors;
+            this._paletteLocation = this.get_uniform_location('spotline_palette');
+            this._paletteSizeLocation = this.get_uniform_location('spotline_palette_size');
+            this._minContrastLocation = this.get_uniform_location('spotline_min_contrast');
+            this._mapLocation = this.get_uniform_location('spotline_map');
+            this._stepLocation = this.get_uniform_location('spotline_step');
+            this._enabledLocation = this.get_uniform_location('spotline_enabled');
+        }
+
+        vfunc_build_pipeline() {
+            this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT, CONTRAST_DECLARATIONS, CONTRAST_CODE, false);
+        }
+
         vfunc_paint_target(node, paintContext) {
             const pipeline = this.get_pipeline();
-            if (pipeline && pipeline !== this._blendedPipeline) {
-                // Everything drawn through this effect is white (premultiplied, so its
-                // color equals its alpha), which makes SRC_COLOR[A] stand in for
-                // SRC_COLOR; Cogl's parser rejects (1-SRC_COLOR) on the destination side
-                // Color is inverted; alpha composites as usual, so the menu stays opaque
-                // when it is drawn through an offscreen buffer
-                pipeline.set_blend('RGB = ADD (SRC_COLOR*(1-DST_COLOR), DST_COLOR*(1-SRC_COLOR[A])) ' +
-                    'A = ADD (SRC_COLOR, DST_COLOR*(1-SRC_COLOR[A]))');
-                this._blendedPipeline = pipeline;
+            if (pipeline) {
+                const coverTexture = this._coverActor.visible ? this._coverCapture.get_texture() : null;
+                // The shader always reads layer 1, so without a cover it gets the text
+                // itself and is switched off (the menu behind is then plain and dark)
+                pipeline.set_layer_texture(1, coverTexture ?? this.get_texture());
+                pipeline.set_layer_combine(1, 'RGBA = REPLACE(PREVIOUS)');
+                this.set_uniform_float(this._enabledLocation, 1, [coverTexture ? 1 : 0]);
+                const {palette, minContrast} = this._getColors();
+                const paletteValues = new Array(PALETTE_MAX_COLORS * 4).fill(0);
+                palette.flat().forEach((v, i) => (paletteValues[i] = v));
+                this.set_uniform_float(this._paletteLocation, 4, paletteValues);
+                this.set_uniform_float(this._paletteSizeLocation, 1, [palette.length]);
+                this.set_uniform_float(this._minContrastLocation, 1, [minContrast]);
+
+                // Where this actor sits on the cover, both in stage pixels; their
+                // paint areas match their allocations, as both clip to them
+                const [ax, ay] = this.actor.get_transformed_position();
+                const [aw, ah] = this.actor.get_transformed_size();
+                const [cx, cy] = this._coverActor.get_transformed_position();
+                const [cw, ch] = this._coverActor.get_transformed_size();
+                if (cw > 0 && ch > 0) {
+                    this.set_uniform_float(this._mapLocation, 4,
+                        [(ax - cx) / cw, (ay - cy) / ch, aw / cw, ah / ch]);
+                    this.set_uniform_float(this._stepLocation, 2,
+                        [CONTRAST_SAMPLE_STEP_PX / cw, CONTRAST_SAMPLE_STEP_PX / ch]);
+                }
             }
             super.vfunc_paint_target(node, paintContext);
         }
@@ -297,6 +514,7 @@ const MusicLyricsIndicator = GObject.registerClass(
             // shades that keep the text on top of it readable
             this._coverLayer = new St.Widget({
                 layout_manager: new Clutter.BinLayout(),
+                clip_to_allocation: true,
                 x_expand: true,
                 y_expand: true,
                 visible: false
@@ -385,11 +603,20 @@ const MusicLyricsIndicator = GObject.registerClass(
                 y_align: Clutter.ActorAlign.END
             });
 
-            // Invert style: no shade, the track info and buttons invert the cover instead
-            this._invertEffects = [new InvertBlendEffect(), new InvertBlendEffect(), new InvertBlendEffect()];
-            this._artLyricsBox.add_effect(this._invertEffects[2]);
+            // Max visibility style: no shades, the track info, buttons and upcoming
+            // lyric pick a color per pixel against the cover instead
+            this._coverCapture = new CoverCaptureEffect();
+            this._coverLayer.add_effect(this._coverCapture);
+            this._coverPalette = [];
+            this._minContrast = MAX_VISIBILITY_MIN_CONTRAST;
+            const getColors = () => ({palette: this._coverPalette, minContrast: this._minContrast});
+            this._contrastEffects = [0, 1, 2].map(() =>
+                new ContrastTextEffect(this._coverLayer, this._coverCapture, getColors));
+            this._artLyricsBox.add_effect(this._contrastEffects[2]);
             const trackTextBox = this._trackTextBox = newVerticalBox({x_expand: true});
-            trackTextBox.add_effect(this._invertEffects[0]);
+            // Clipped, so the shader's view of where it sits on the cover is exact
+            trackTextBox.clip_to_allocation = true;
+            trackTextBox.add_effect(this._contrastEffects[0]);
             this._trackTitleLabel = new St.Label({style_class: 'spotline-track-title'});
             this._trackArtistLabel = new St.Label({style_class: 'spotline-track-artist'});
             for (const label of [this._trackTitleLabel, this._trackArtistLabel]) {
@@ -433,7 +660,8 @@ const MusicLyricsIndicator = GObject.registerClass(
             controlsBox.add_child(prevButton);
             controlsBox.add_child(playPauseButton);
             controlsBox.add_child(nextButton);
-            controlsBox.add_effect(this._invertEffects[1]);
+            controlsBox.clip_to_allocation = true;
+            controlsBox.add_effect(this._contrastEffects[1]);
             content.add_child(controlsBox);
 
             card.add_child(content);
@@ -454,19 +682,21 @@ const MusicLyricsIndicator = GObject.registerClass(
             this._syncTrackInfoStyle();
         }
 
-        // Shade: a dark backing behind the track info and buttons. Invert: no
-        // backing, and they invert the colors of the cover beneath them.
+        // Shade: a dark backing behind the track info and buttons. Max visibility:
+        // no shades, and every pixel of them takes a cover color, or black or white,
+        // that stands out against the cover beneath (see ContrastTextEffect).
         _syncTrackInfoStyle() {
-            const invert = this._invertStyle = this._settings.get_string('track-info-style') === 'invert';
-            this._bottomShades.visible = !invert;
-            for (const effect of this._invertEffects) {
-                effect.enabled = invert;
+            const maxVisibility = this._maxVisibility =
+                this._settings.get_string('track-info-style') === 'max-visibility';
+            this._bottomShades.visible = !maxVisibility;
+            for (const effect of [this._coverCapture, ...this._contrastEffects]) {
+                effect.enabled = maxVisibility;
             }
             for (const widget of [this._cardContent, this._artLyricsBox]) {
-                if (invert) {
-                    widget.add_style_class_name('spotline-invert');
+                if (maxVisibility) {
+                    widget.add_style_class_name('spotline-max-visibility');
                 } else {
-                    widget.remove_style_class_name('spotline-invert');
+                    widget.remove_style_class_name('spotline-max-visibility');
                 }
             }
             this._syncArtLyricsVisible();
@@ -961,6 +1191,12 @@ const MusicLyricsIndicator = GObject.registerClass(
                 return;
             }
             back.widget.style = `background-image: url("${back.file.get_uri()}");`;
+            try {
+                back.palette = extractCoverPalette(bytes);
+            } catch (e) {
+                logError(e, 'Failed to read the album art colors');
+                back.palette = [];
+            }
 
             // A file St never loaded has no monitor, so the signal may never come
             this._pendingArtSwap = {
@@ -999,6 +1235,12 @@ const MusicLyricsIndicator = GObject.registerClass(
             } else {
                 back.widget.opacity = 255;
                 front.widget.opacity = 0;
+            }
+
+            // The text takes the new cover's colors as it starts fading in
+            this._coverPalette = back.palette ?? [];
+            for (const effect of this._contrastEffects) {
+                effect.queue_repaint();
             }
 
             this._albumArtReady = true;
@@ -1069,7 +1311,7 @@ const MusicLyricsIndicator = GObject.registerClass(
             const visible = this._artLyricsActive && this._albumArtExpanded;
             this._artLyricsBox.visible = visible;
             // The invert style needs no shade behind it
-            this._artLyricsShade.visible = visible && !this._invertStyle;
+            this._artLyricsShade.visible = visible && !this._maxVisibility;
         }
 
         _clearLyrics() {

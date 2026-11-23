@@ -69,10 +69,10 @@ export default class SpotLinePreferences extends ExtensionPreferences {
             title: 'Track Info Style',
             subtitle: 'How the title, artist and buttons stay readable over the cover',
             model: new Gtk.StringList({
-                strings: ['Dark Shade', 'Invert Colors']
+                strings: ['Dark Shade', 'Max Visibility']
             })
         });
-        const trackInfoStyles = ['shade', 'invert'];
+        const trackInfoStyles = ['shade', 'max-visibility'];
         trackInfoRow.selected = Math.max(0, trackInfoStyles.indexOf(settings.get_string('track-info-style')));
         trackInfoRow.connect('notify::selected', () => {
             settings.set_string('track-info-style', trackInfoStyles[trackInfoRow.selected]);

@@ -91,10 +91,10 @@
     text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
 
-/* Invert style: pure white and no shadow, which the invert blend (see
-   InvertBlendEffect) turns into the exact inverse of the cover beneath */
-.spotline-invert .spotline-track-title,
-.spotline-invert .spotline-track-artist {
+/* Max visibility style: no shadow, and opaque, as ContrastTextEffect recolors
+   every pixel against the cover; white is the fallback without one */
+.spotline-max-visibility .spotline-track-title,
+.spotline-max-visibility .spotline-track-artist {
     color: #ffffff;
     text-shadow: none;
 }
@@ -119,8 +119,8 @@
     text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
 
-/* Invert style: see the track title */
-.spotline-invert .spotline-art-lyric {
+/* Max visibility style: see the track title */
+.spotline-max-visibility .spotline-art-lyric {
     color: #ffffff;
     text-shadow: none;
 }

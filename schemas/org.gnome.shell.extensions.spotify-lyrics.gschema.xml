@@ -32,10 +32,10 @@
       <default>'shade'</default>
       <choices>
         <choice value='shade'/>
-        <choice value='invert'/>
+        <choice value='max-visibility'/>
       </choices>
       <summary>Track Info Style</summary>
-      <description>How the title, artist and buttons stay readable over the album art: a dark shade behind them, or colors that invert the cover beneath</description>
+      <description>How the title, artist and buttons stay readable over the album art: a dark shade behind them, or each pixel black or white, whichever contrasts more with the cover beneath</description>
     </key>
     <key name="toggle-menu-shortcut" type="as">
       <default><![CDATA[['<Super>z']]]></default>
